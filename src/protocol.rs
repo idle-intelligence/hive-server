@@ -32,11 +32,24 @@ pub enum ClientMsg {
 pub enum HubMsg {
     Task {
         task_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        question_id: Option<String>,
         system: String,
         prompt: String,
         max_tokens: u32,
     },
     Log {
         line: String,
+    },
+    Answer {
+        question_id: String,
+        text: String,
+        peer_id: String,
+        total_tokens: u32,
+        total_ms: u64,
+        peers_used: u32,
+    },
+    Error {
+        text: String,
     },
 }

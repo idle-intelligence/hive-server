@@ -1,6 +1,7 @@
 mod hub;
 mod log;
 mod protocol;
+mod router;
 mod state;
 
 use tokio::net::TcpListener;
@@ -15,6 +16,7 @@ async fn main() {
     println!("{ts} [swarm] hive-server listening on ws://{addr}");
 
     let hub = hub::Hub::new();
+    hub.start_stats_ticker();
 
     loop {
         let (stream, peer_addr) = match listener.accept().await {
