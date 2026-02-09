@@ -34,8 +34,8 @@ pub struct PendingQuestion {
     pub probe_conn_id: usize,
     pub text: String,
     pub messages: Vec<crate::protocol::ChatMessage>,
-    /// task_id → conn_id for generation tasks
-    pub task_peers: HashMap<String, usize>,
+    pub task_id: String,
+    pub gen_peers: Vec<usize>,
     pub results: Vec<TaskResult>,
     pub expected_results: usize,
     pub arbiter_task_id: Option<String>,

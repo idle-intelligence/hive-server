@@ -186,25 +186,27 @@ impl Hub {
         }
 
         let n = selected.len();
-        let mut task_peers = HashMap::new();
-        let mut tasks_to_send = Vec::new();
+        let task_id = format!("task_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let max_tokens: u32 = if is_time_task { 64 } else { 128 };
+
+        let mut gen_peers = Vec::new();
+        let mut peers_to_send: Vec<(usize, PeerInfo)> = Vec::new();
 
         for (conn_id, peer_info) in &selected {
-            let task_id = format!("task_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-            task_peers.insert(task_id.clone(), *conn_id);
-            state.task_to_question.insert(task_id.clone(), q_id.to_string());
+            gen_peers.push(*conn_id);
             state.busy_peers.insert(*conn_id);
-            tasks_to_send.push((task_id, *conn_id, peer_info.clone()));
+            peers_to_send.push((*conn_id, peer_info.clone()));
         }
 
-        let max_tokens: u32 = if is_time_task { 64 } else { 128 };
+        state.task_to_question.insert(task_id.clone(), q_id.to_string());
 
         let pending = PendingQuestion {
             question_id: q_id.to_string(),
             probe_conn_id,
             text: text.to_string(),
             messages: messages.to_vec(),
-            task_peers,
+            task_id: task_id.clone(),
+            gen_peers,
             results: Vec::new(),
             expected_results: n,
             arbiter_task_id: None,
@@ -216,9 +218,14 @@ impl Hub {
         state.questions.insert(q_id.to_string(), pending);
         drop(state);
 
+        // One log line listing all assigned peers
+        let peer_ids: Vec<String> = peers_to_send.iter().map(|(_, p)| p.peer_id.clone()).collect();
+        let line = hlog::task_assigned(&task_id, &peer_ids);
+        self.emit(&line).await;
+
         let question_id_for_msg = if is_time_task { None } else { Some(q_id.to_string()) };
 
-        for (task_id, conn_id, peer_info) in &tasks_to_send {
+        for (conn_id, peer_info) in &peers_to_send {
             let system = if is_time_task {
                 format!("You are a {} in a distributed swarm of language models. You will be told the current time. Rewrite it naturally in your own words, then add a brief observation. Write it as a single flowing sentence. Do not use JSON. Do not repeat the exact format you were given.", tier_label(&peer_info.tier))
             } else {
@@ -231,8 +238,6 @@ impl Hub {
                 messages: messages.to_vec(),
                 max_tokens,
             };
-            let line = hlog::task_assigned(task_id, &peer_info.peer_id, &peer_info.model, &peer_info.tier);
-            self.emit(&line).await;
             self.send_to(*conn_id, &task).await;
         }
 
@@ -481,7 +486,7 @@ impl Hub {
         };
 
         // Extract data we need while holding an immutable borrow
-        let gen_conn_ids: Vec<usize> = question.task_peers.values().cloned().collect();
+        let gen_conn_ids: Vec<usize> = question.gen_peers.clone();
         let q_text = question.text.clone();
         let results_snapshot: Vec<TaskResult> = question.results.clone();
         let probe = question.probe_conn_id;

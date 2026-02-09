@@ -20,8 +20,9 @@ pub fn peer_left(peer_id: &str, reason: &str) -> String {
     format!("{} [peer] {} left ({})", ts(), peer_id, reason)
 }
 
-pub fn task_assigned(task_id: &str, peer_id: &str, model: &str, tier: &str) -> String {
-    format!("{} [task {}] assigned to {} ({}, {})", ts(), task_id, peer_id, model, tier)
+pub fn task_assigned(task_id: &str, peer_ids: &[String]) -> String {
+    let list = peer_ids.join(", ");
+    format!("{} [task {}] assigned to [{}]", ts(), task_id, list)
 }
 
 pub fn task_completed(task_id: &str, peer_id: &str, tokens: u32, inference_ms: u64, tok_s: f64) -> String {
