@@ -15,11 +15,11 @@ pub fn select_peers(
         .map(|(&id, info)| (id, info))
         .collect();
 
-    // Sort: heavy first, then worker, then lite; break ties by lower load
+    // Sort: carrier first, then drone, then probe; break ties by lower load
     candidates.sort_by(|a, b| {
         let tier_rank = |t: &str| match t {
-            "heavy" => 0u8,
-            "worker" => 1,
+            "carrier" => 0u8,
+            "drone" => 1,
             _ => 2,
         };
         tier_rank(&a.1.tier)

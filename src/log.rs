@@ -32,14 +32,14 @@ pub fn question_received(q_id: &str, text: &str) -> String {
     format!("{} [question {}] received: \"{}\"", ts(), q_id, text)
 }
 
-pub fn judge_assigned(judge_id: &str, peer_id: &str, model: &str, tier: &str) -> String {
-    format!("{} [judge {}] assigned to {} ({}, {})", ts(), judge_id, peer_id, model, tier)
+pub fn arbiter_assigned(arbiter_id: &str, peer_id: &str, model: &str, tier: &str) -> String {
+    format!("{} [arbiter {}] assigned to {} ({}, {})", ts(), arbiter_id, peer_id, model, tier)
 }
 
-pub fn judge_completed(judge_id: &str, picked_peer: &str, candidates: usize, secs: f64) -> String {
+pub fn arbiter_completed(arbiter_id: &str, picked_peer: &str, candidates: usize, secs: f64) -> String {
     format!(
-        "{} [judge {}] picked {} ({} candidates, {:.1}s)",
-        ts(), judge_id, picked_peer, candidates, secs
+        "{} [arbiter {}] picked {} ({} candidates, {:.1}s)",
+        ts(), arbiter_id, picked_peer, candidates, secs
     )
 }
 
@@ -71,25 +71,25 @@ pub fn swarm_status(peer_count: usize) -> String {
 }
 
 pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, spectators: usize, questions_today: u64, total_flops: f64) -> String {
-    let mut heavy = 0u32;
-    let mut worker = 0u32;
-    let mut lite = 0u32;
+    let mut carrier = 0u32;
+    let mut drone = 0u32;
+    let mut probe = 0u32;
     let mut total_tok_s = 0.0;
 
     for peer in peers.values() {
         match peer.tier.as_str() {
-            "heavy" => heavy += 1,
-            "worker" => worker += 1,
-            _ => lite += 1,
+            "carrier" => carrier += 1,
+            "drone" => drone += 1,
+            _ => probe += 1,
         }
         total_tok_s += peer.tok_s;
     }
 
     let total = peers.len();
     let mut tiers = Vec::new();
-    if heavy > 0 { tiers.push(format!("{heavy} heavy")); }
-    if worker > 0 { tiers.push(format!("{worker} worker")); }
-    if lite > 0 { tiers.push(format!("{lite} lite")); }
+    if carrier > 0 { tiers.push(format!("{carrier} carrier")); }
+    if drone > 0 { tiers.push(format!("{drone} drone")); }
+    if probe > 0 { tiers.push(format!("{probe} probe")); }
     let tier_str = if tiers.is_empty() {
         String::new()
     } else {

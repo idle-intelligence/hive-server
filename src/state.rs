@@ -24,7 +24,7 @@ pub struct TaskResult {
 #[derive(Debug, PartialEq)]
 pub enum QuestionPhase {
     Generating,
-    Judging,
+    Arbitrating,
     Done,
 }
 
@@ -38,8 +38,8 @@ pub struct PendingQuestion {
     pub task_peers: HashMap<String, usize>,
     pub results: Vec<TaskResult>,
     pub expected_results: usize,
-    pub judge_task_id: Option<String>,
-    pub judge_conn_id: Option<usize>,
+    pub arbiter_task_id: Option<String>,
+    pub arbiter_conn_id: Option<usize>,
     pub start: Instant,
     pub phase: QuestionPhase,
     pub is_time_task: bool,

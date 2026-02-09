@@ -164,8 +164,8 @@ impl Hub {
             task_peers,
             results: Vec::new(),
             expected_results: n,
-            judge_task_id: None,
-            judge_conn_id: None,
+            arbiter_task_id: None,
+            arbiter_conn_id: None,
             start: Instant::now(),
             phase: QuestionPhase::Generating,
             is_time_task: false,
@@ -245,11 +245,11 @@ impl Hub {
             _ => return,
         };
 
-        // Is this the judge's result?
-        if question.phase == QuestionPhase::Judging
-            && question.judge_task_id.as_deref() == Some(&task_id)
+        // Is this the arbiter's result?
+        if question.phase == QuestionPhase::Arbitrating
+            && question.arbiter_task_id.as_deref() == Some(&task_id)
         {
-            let picked_idx = parse_judge_pick(&result.text, question.results.len());
+            let picked_idx = parse_arbiter_pick(&result.text, question.results.len());
             let picked_result = question.results[picked_idx].clone();
             let candidates = question.results.len();
             let elapsed_ms = question.start.elapsed().as_millis() as u64;
@@ -261,8 +261,8 @@ impl Hub {
             question.phase = QuestionPhase::Done;
             drop(state);
 
-            let judge_secs = result.inference_ms as f64 / 1000.0;
-            let line = hlog::judge_completed(&result.task_id, &picked_result.peer_id, candidates, judge_secs);
+            let arbiter_secs = result.inference_ms as f64 / 1000.0;
+            let line = hlog::arbiter_completed(&result.task_id, &picked_result.peer_id, candidates, arbiter_secs);
             self.emit(&line).await;
 
             let total_secs = elapsed_ms as f64 / 1000.0;
@@ -326,16 +326,16 @@ impl Hub {
             };
             self.send_to(questioner, &answer).await;
         } else if question.results.len() >= question.expected_results {
-            // All 3 results collected — proceed to judging
+            // All 3 results collected — proceed to arbitration
             let q_id = question_id.clone();
             drop(state);
-            self.proceed_to_judging(&q_id).await;
+            self.proceed_to_arbitration(&q_id).await;
         }
     }
 
-    // ── Judging ─────────────────────────────────────────────────────
+    // ── Arbiter ──────────────────────────────────────────────────────
 
-    async fn proceed_to_judging(self: &Arc<Self>, question_id: &str) {
+    async fn proceed_to_arbitration(self: &Arc<Self>, question_id: &str) {
         let mut state = self.state.lock().await;
 
         // Check phase first
@@ -358,48 +358,48 @@ impl Hub {
         }
         exclude.insert(questioner);
 
-        let judges = router::select_peers(&state.peers, &exclude, 1);
+        let arbiters = router::select_peers(&state.peers, &exclude, 1);
 
-        if let Some((judge_conn_id, judge_info)) = judges.into_iter().next() {
-            let judge_task_id = format!("judge_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        if let Some((arbiter_conn_id, arbiter_info)) = arbiters.into_iter().next() {
+            let arbiter_task_id = format!("arb_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
-            // Build judge message content
+            // Build arbiter message content
             let mut content = format!("Question: {}\n", q_text);
             for (i, r) in results_snapshot.iter().enumerate() {
                 content.push_str(&format!("\nAnswer {}: {}", i + 1, r.text));
             }
             content.push_str("\n\nWhich answer is best? Respond with only the number.");
 
-            let judge_messages = vec![crate::protocol::ChatMessage {
+            let arbiter_messages = vec![crate::protocol::ChatMessage {
                 role: "user".to_string(),
                 content,
             }];
 
             // Now take mutable borrow to update phase
             let question = state.questions.get_mut(question_id).unwrap();
-            question.judge_task_id = Some(judge_task_id.clone());
-            question.judge_conn_id = Some(judge_conn_id);
-            question.phase = QuestionPhase::Judging;
+            question.arbiter_task_id = Some(arbiter_task_id.clone());
+            question.arbiter_conn_id = Some(arbiter_conn_id);
+            question.phase = QuestionPhase::Arbitrating;
 
-            state.task_to_question.insert(judge_task_id.clone(), question_id.to_string());
-            state.busy_peers.insert(judge_conn_id);
+            state.task_to_question.insert(arbiter_task_id.clone(), question_id.to_string());
+            state.busy_peers.insert(arbiter_conn_id);
             drop(state);
 
-            let line = hlog::judge_assigned(
-                &judge_task_id, &judge_info.peer_id, &judge_info.model, &judge_info.tier,
+            let line = hlog::arbiter_assigned(
+                &arbiter_task_id, &arbiter_info.peer_id, &arbiter_info.model, &arbiter_info.tier,
             );
             self.emit(&line).await;
 
             let task = HubMsg::Task {
-                task_id: judge_task_id,
+                task_id: arbiter_task_id,
                 question_id: Some(question_id.to_string()),
-                system: "You are a judge. You will receive a question and several candidate answers. Pick the best one. Respond with ONLY the number (1, 2, or 3) of the best answer.".to_string(),
-                messages: judge_messages,
+                system: "You are an arbiter. You will receive a question and several candidate answers. Pick the best one. Respond with ONLY the number (1, 2, or 3) of the best answer.".to_string(),
+                messages: arbiter_messages,
                 max_tokens: 8,
             };
-            self.send_to(judge_conn_id, &task).await;
+            self.send_to(arbiter_conn_id, &task).await;
         } else {
-            // No judge available — return first result
+            // No arbiter available — return first result
             let first = results_snapshot[0].clone();
             let elapsed_ms = start.elapsed().as_millis() as u64;
             let q_id = question_id.to_string();
@@ -410,7 +410,7 @@ impl Hub {
             drop(state);
 
             let line = format!(
-                "{} [error] no judge available for {}, returning first response",
+                "{} [error] no arbiter available for {}, returning first response",
                 hlog::ts(), q_id
             );
             self.emit(&line).await;
@@ -457,14 +457,14 @@ impl Hub {
                     let err = HubMsg::Error { text: "All peers timed out".to_string() };
                     self.send_to(questioner, &err).await;
                 } else {
-                    // Got some results — try to judge with what we have
+                    // Got some results — try to arbitrate with what we have
                     let q_id = question_id.to_string();
                     drop(state);
-                    self.proceed_to_judging(&q_id).await;
+                    self.proceed_to_arbitration(&q_id).await;
                 }
             }
-            QuestionPhase::Judging => {
-                // Judge timed out — deliver first result
+            QuestionPhase::Arbitrating => {
+                // Arbiter timed out — deliver first result
                 let first = question.results[0].clone();
                 let elapsed_ms = question.start.elapsed().as_millis() as u64;
                 let questioner = question.questioner_conn_id;
@@ -474,7 +474,7 @@ impl Hub {
                 drop(state);
 
                 let line = format!(
-                    "{} [error] judge timed out for {}, returning first response",
+                    "{} [error] arbiter timed out for {}, returning first response",
                     hlog::ts(), q_id
                 );
                 self.emit(&line).await;
@@ -576,8 +576,8 @@ impl Hub {
             task_peers,
             results: Vec::new(),
             expected_results: 1,
-            judge_task_id: None,
-            judge_conn_id: None,
+            arbiter_task_id: None,
+            arbiter_conn_id: None,
             start: Instant::now(),
             phase: QuestionPhase::Generating,
             is_time_task: true,
@@ -651,8 +651,8 @@ impl Hub {
     }
 }
 
-/// Parse the judge's text to extract a pick (1-indexed). Falls back to 0 (first answer).
-fn parse_judge_pick(text: &str, n_candidates: usize) -> usize {
+/// Parse the arbiter's text to extract a pick (1-indexed). Falls back to 0 (first answer).
+fn parse_arbiter_pick(text: &str, n_candidates: usize) -> usize {
     for ch in text.chars() {
         if let Some(digit) = ch.to_digit(10) {
             let idx = digit as usize;
