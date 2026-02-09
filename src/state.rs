@@ -126,10 +126,6 @@ impl HubState {
         self.peers.len()
     }
 
-    pub fn queue_len(&self) -> usize {
-        self.normal_queue.len() + self.low_queue.len()
-    }
-
     pub fn normal_queue_full(&self) -> bool {
         self.normal_queue.len() >= MAX_NORMAL_QUEUE
     }

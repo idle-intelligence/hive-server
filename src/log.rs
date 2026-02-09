@@ -67,24 +67,8 @@ pub fn time_skipped() -> String {
     format!("{} [time] skipped — no peers available", ts())
 }
 
-pub fn task_queued(q_id: &str, queue_len: usize) -> String {
-    format!("{} [queue] {} queued ({} in queue)", ts(), q_id, queue_len)
-}
-
-pub fn queue_dispatch(q_id: &str, queue_len: usize) -> String {
-    format!("{} [queue] {} dispatched ({} remaining)", ts(), q_id, queue_len)
-}
-
-pub fn arbiter_queued(q_id: &str, queue_len: usize) -> String {
-    format!("{} [queue] {} awaiting arbiter ({} in queue)", ts(), q_id, queue_len)
-}
-
 pub fn queue_full(q_id: &str) -> String {
     format!("{} [queue] {} rejected — queue full", ts(), q_id)
-}
-
-pub fn archivist_queued(q_id: &str, queue_len: usize) -> String {
-    format!("{} [queue] archivist for {} queued ({} in low queue)", ts(), q_id, queue_len)
 }
 
 pub fn archivist_result(task_id: &str, peer_id: &str, text: &str, tokens: u32, secs: f64) -> String {

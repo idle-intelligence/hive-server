@@ -159,11 +159,7 @@ impl Hub {
             task_type: TaskType::Answer,
             arbitration_for: None,
         });
-        let queue_len = state.queue_len();
         drop(state);
-
-        let line = hlog::task_queued(&q_id, queue_len);
-        self.emit(&line).await;
     }
 
     /// Try to route a question to peers right now. Returns true if dispatched.
@@ -296,9 +292,6 @@ impl Hub {
                     break;
                 }
             };
-
-            let line = hlog::queue_dispatch(&queued.question_id, self.state.lock().await.queue_len());
-            self.emit(&line).await;
 
             if let Some(ref q_id) = queued.arbitration_for {
                 if !self.try_assign_arbiter(q_id).await {
@@ -509,11 +502,7 @@ impl Hub {
                     task_type: TaskType::Arbiter,
                     arbitration_for: Some(q_id.clone()),
                 });
-                let queue_len = state.queue_len();
                 drop(state);
-
-                let line = hlog::arbiter_queued(&q_id, queue_len);
-                self.emit(&line).await;
             }
         }
     }
@@ -710,6 +699,7 @@ impl Hub {
             hub.emit_stats().await;
 
             let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await; // skip immediate first tick
             loop {
                 interval.tick().await;
                 hub.emit_stats().await;
@@ -726,8 +716,8 @@ impl Hub {
             tokio::time::sleep(Duration::from_secs(secs_until)).await;
             hub.handle_time_tick().await;
 
-            // Then tick every 60s, aligned to the minute
             let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await; // skip immediate first tick
             loop {
                 interval.tick().await;
                 hub.handle_time_tick().await;
@@ -766,11 +756,7 @@ impl Hub {
             task_type: TaskType::Time,
             arbitration_for: None,
         });
-        let queue_len = state.queue_len();
         drop(state);
-
-        let line = hlog::task_queued(&q_id, queue_len);
-        self.emit(&line).await;
     }
 
     async fn emit_stats(&self) {
@@ -789,7 +775,7 @@ impl Hub {
 
     // ── Archivist ─────────────────────────────────────────────────────
 
-    async fn queue_archivist(self: &Arc<Self>, question_id: &str, question_text: &str, answer_text: &str) {
+    async fn queue_archivist(self: &Arc<Self>, _question_id: &str, question_text: &str, answer_text: &str) {
         let arch_id = format!("arch_{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let messages = vec![ChatMessage {
             role: "user".to_string(),
@@ -808,11 +794,7 @@ impl Hub {
             task_type: TaskType::Archivist,
             arbitration_for: None,
         });
-        let queue_len = state.low_queue.len();
         drop(state);
-
-        let line = hlog::archivist_queued(question_id, queue_len);
-        self.emit(&line).await;
     }
 
     // ── Transport ───────────────────────────────────────────────────
