@@ -50,10 +50,6 @@ pub fn answer_delivered(q_id: &str, total_tokens: u32, total_secs: f64, peers_us
     )
 }
 
-pub fn error_no_peers(q_id: &str) -> String {
-    format!("{} [error] no peers available for question {}", ts(), q_id)
-}
-
 pub fn time_result(peer_id: &str, result_text: &str, tokens: u32, flops: f64) -> String {
     let text = result_text.trim();
     format!(
@@ -64,6 +60,18 @@ pub fn time_result(peer_id: &str, result_text: &str, tokens: u32, flops: f64) ->
 
 pub fn time_skipped() -> String {
     format!("{} [time] skipped — no peers available", ts())
+}
+
+pub fn task_queued(q_id: &str, queue_len: usize) -> String {
+    format!("{} [queue] {} queued ({} in queue)", ts(), q_id, queue_len)
+}
+
+pub fn queue_dispatch(q_id: &str, queue_len: usize) -> String {
+    format!("{} [queue] {} dispatched ({} remaining)", ts(), q_id, queue_len)
+}
+
+pub fn queue_full(q_id: &str) -> String {
+    format!("{} [queue] {} rejected — queue full", ts(), q_id)
 }
 
 pub fn swarm_status(peer_count: usize) -> String {

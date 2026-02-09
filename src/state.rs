@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -46,11 +46,23 @@ pub struct PendingQuestion {
 }
 
 #[derive(Debug)]
+pub struct QueuedQuestion {
+    pub question_id: String,
+    pub questioner_conn_id: usize,
+    pub text: String,
+    pub messages: Vec<crate::protocol::ChatMessage>,
+    pub is_time_task: bool,
+}
+
+const MAX_QUEUE_LEN: usize = 20;
+
+#[derive(Debug)]
 pub struct HubState {
     pub peers: HashMap<usize, PeerInfo>,
     pub questions: HashMap<String, PendingQuestion>,
     pub task_to_question: HashMap<String, String>,
     pub busy_peers: HashSet<usize>,
+    pub task_queue: VecDeque<QueuedQuestion>,
     pub questions_today: u64,
     pub total_flops: f64,
 }
@@ -62,6 +74,7 @@ impl HubState {
             questions: HashMap::new(),
             task_to_question: HashMap::new(),
             busy_peers: HashSet::new(),
+            task_queue: VecDeque::new(),
             questions_today: 0,
             total_flops: 0.0,
         }
@@ -84,5 +97,13 @@ impl HubState {
 
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.task_queue.len()
+    }
+
+    pub fn queue_full(&self) -> bool {
+        self.task_queue.len() >= MAX_QUEUE_LEN
     }
 }

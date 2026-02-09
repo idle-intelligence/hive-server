@@ -14,7 +14,7 @@ use tokio_tungstenite::WebSocketStream;
 use crate::log as hlog;
 use crate::protocol::{ChatMessage, ClientMsg, HubMsg};
 use crate::router;
-use crate::state::{HubState, PeerInfo, PendingQuestion, QuestionPhase, TaskResult};
+use crate::state::{HubState, PeerInfo, PendingQuestion, QueuedQuestion, QuestionPhase, TaskResult};
 
 /// SmolLM2 1.7B ≈ 1.7B params × 2 ops/param = 3.4 GFLOPS per token
 const FLOPS_PER_TOKEN: f64 = 3.4e9;
@@ -93,6 +93,8 @@ impl Hub {
                 let count = self.state.lock().await.peer_count();
                 let status = hlog::swarm_status(count);
                 self.emit(&status).await;
+
+                self.try_dispatch_queue().await;
             }
 
             ClientMsg::Result { task_id, text, tok_s, tokens, inference_ms } => {
@@ -126,22 +128,55 @@ impl Hub {
         let line = hlog::question_received(&q_id, &text);
         self.emit(&line).await;
 
-        // Select peers and set up state under lock
+        {
+            self.state.lock().await.questions_today += 1;
+        }
+
+        if self.route_question(&q_id, questioner_conn_id, &text, &messages, false).await {
+            return;
+        }
+
+        // No peers available — try to queue
         let mut state = self.state.lock().await;
-        state.questions_today += 1;
-
-        // Exclude the questioner from the candidate pool
-        let mut exclude = state.busy_peers.clone();
-        exclude.insert(questioner_conn_id);
-        let selected = router::select_peers(&state.peers, &exclude, 3);
-
-        if selected.is_empty() {
+        if state.queue_full() {
             drop(state);
-            let line = hlog::error_no_peers(&q_id);
+            let line = hlog::queue_full(&q_id);
             self.emit(&line).await;
-            let err = HubMsg::Error { text: "No peers available".to_string() };
+            let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
             self.send_to(questioner_conn_id, &err).await;
             return;
+        }
+        state.task_queue.push_back(QueuedQuestion {
+            question_id: q_id.clone(),
+            questioner_conn_id,
+            text: text.clone(),
+            messages: messages.clone(),
+            is_time_task: false,
+        });
+        let queue_len = state.queue_len();
+        drop(state);
+
+        let line = hlog::task_queued(&q_id, queue_len);
+        self.emit(&line).await;
+    }
+
+    /// Try to route a question to peers right now. Returns true if dispatched.
+    async fn route_question(
+        self: &Arc<Self>,
+        q_id: &str,
+        questioner_conn_id: usize,
+        text: &str,
+        messages: &[crate::protocol::ChatMessage],
+        is_time_task: bool,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+
+        let mut exclude = state.busy_peers.clone();
+        exclude.insert(questioner_conn_id);
+        let selected = router::select_peers(&state.peers, &exclude, if is_time_task { 1 } else { 3 });
+
+        if selected.is_empty() {
+            return false;
         }
 
         let n = selected.len();
@@ -151,16 +186,22 @@ impl Hub {
         for (conn_id, peer_info) in &selected {
             let task_id = format!("task_{}", &uuid::Uuid::new_v4().to_string()[..8]);
             task_peers.insert(task_id.clone(), *conn_id);
-            state.task_to_question.insert(task_id.clone(), q_id.clone());
+            state.task_to_question.insert(task_id.clone(), q_id.to_string());
             state.busy_peers.insert(*conn_id);
             tasks_to_send.push((task_id, *conn_id, peer_info.clone()));
         }
 
+        let (system, max_tokens) = if is_time_task {
+            ("You are a drone in a distributed swarm of language models. You will be told the current time. Rewrite it naturally in your own words, then add a brief observation. Write it as a single flowing sentence. Do not use JSON. Do not repeat the exact format you were given.".to_string(), 64)
+        } else {
+            ("Answer the following question concisely and accurately.".to_string(), 256)
+        };
+
         let pending = PendingQuestion {
-            question_id: q_id.clone(),
+            question_id: q_id.to_string(),
             questioner_conn_id,
-            text: text.clone(),
-            messages: messages.clone(),
+            text: text.to_string(),
+            messages: messages.to_vec(),
             task_peers,
             results: Vec::new(),
             expected_results: n,
@@ -168,19 +209,20 @@ impl Hub {
             arbiter_conn_id: None,
             start: Instant::now(),
             phase: QuestionPhase::Generating,
-            is_time_task: false,
+            is_time_task,
         };
-        state.questions.insert(q_id.clone(), pending);
+        state.questions.insert(q_id.to_string(), pending);
         drop(state);
 
-        // Send tasks and emit log lines
+        let question_id_for_msg = if is_time_task { None } else { Some(q_id.to_string()) };
+
         for (task_id, conn_id, peer_info) in &tasks_to_send {
             let task = HubMsg::Task {
                 task_id: task_id.clone(),
-                question_id: Some(q_id.clone()),
-                system: "Answer the following question concisely and accurately.".to_string(),
-                messages: messages.clone(),
-                max_tokens: 256,
+                question_id: question_id_for_msg.clone(),
+                system: system.clone(),
+                messages: messages.to_vec(),
+                max_tokens,
             };
             let line = hlog::task_assigned(task_id, &peer_info.peer_id, &peer_info.model, &peer_info.tier);
             self.emit(&line).await;
@@ -189,16 +231,68 @@ impl Hub {
 
         // Spawn 30s timeout
         let hub = Arc::clone(self);
-        let q_id_clone = q_id;
+        let q_id_owned = q_id.to_string();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            hub.handle_timeout(&q_id_clone).await;
+            hub.handle_timeout(&q_id_owned).await;
         });
+
+        true
+    }
+
+    // ── Queue dispatch ──────────────────────────────────────────────
+
+    async fn try_dispatch_queue(self: &Arc<Self>) {
+        loop {
+            let queued = {
+                let mut state = self.state.lock().await;
+                // Peek: is there anything in the queue and any idle peer?
+                let has_idle = state.peers.keys().any(|id| !state.busy_peers.contains(id));
+                if !has_idle {
+                    break;
+                }
+                match state.task_queue.pop_front() {
+                    Some(q) => q,
+                    None => break,
+                }
+            };
+
+            let line = hlog::queue_dispatch(&queued.question_id, self.state.lock().await.queue_len());
+            self.emit(&line).await;
+
+            let dispatched = self.route_question(
+                &queued.question_id,
+                queued.questioner_conn_id,
+                &queued.text,
+                &queued.messages,
+                queued.is_time_task,
+            ).await;
+
+            if !dispatched {
+                // Race: peer got busy between check and route. Re-queue at front and stop.
+                let mut state = self.state.lock().await;
+                state.task_queue.push_front(queued);
+                break;
+            }
+        }
     }
 
     // ── Result handling ─────────────────────────────────────────────
 
     async fn handle_result(
+        self: &Arc<Self>,
+        conn_id: usize,
+        task_id: String,
+        text: String,
+        tok_s: f64,
+        tokens: u32,
+        inference_ms: u64,
+    ) {
+        self.handle_result_inner(conn_id, task_id, text, tok_s, tokens, inference_ms).await;
+        self.try_dispatch_queue().await;
+    }
+
+    async fn handle_result_inner(
         self: &Arc<Self>,
         conn_id: usize,
         task_id: String,
@@ -393,7 +487,7 @@ impl Hub {
             let task = HubMsg::Task {
                 task_id: arbiter_task_id,
                 question_id: Some(question_id.to_string()),
-                system: "You are an arbiter. You will receive a question and several candidate answers. Pick the best one. Respond with ONLY the number (1, 2, or 3) of the best answer.".to_string(),
+                system: "You are an arbiter in a distributed swarm of language models. You will receive a question and several candidate answers from other nodes. Pick the best one.\n\nRespond with ONLY the number of the best answer. Nothing else.".to_string(),
                 messages: arbiter_messages,
                 max_tokens: 8,
             };
@@ -538,71 +632,38 @@ impl Hub {
     async fn handle_time_tick(self: &Arc<Self>) {
         let now = chrono::Utc::now();
         let tag = now.timestamp();
-        let task_id = format!("time_{}", tag);
         let q_id = format!("time_{}", tag);
 
-        let system = "You will be told the current time. Rewrite it naturally in your own words, \
-            then add a brief observation. Write it as a single flowing sentence. \
-            Do not use JSON. Do not repeat the exact format you were given."
-            .to_string();
         let readable = now.format("%A, %B %-d, %Y, %H:%M UTC").to_string();
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: format!("Current time: {readable}"),
         }];
 
-        let mut state = self.state.lock().await;
+        if self.route_question(&q_id, 0, "", &messages, true).await {
+            return;
+        }
 
-        let selected = router::select_peers(&state.peers, &state.busy_peers, 1);
-        if selected.is_empty() {
+        // No peers — try to queue at front (time tasks get priority)
+        let mut state = self.state.lock().await;
+        if state.queue_full() {
             drop(state);
             let line = hlog::time_skipped();
             self.emit(&line).await;
             return;
         }
-
-        let (peer_conn_id, peer_info) = selected.into_iter().next().unwrap();
-
-        let mut task_peers = HashMap::new();
-        task_peers.insert(task_id.clone(), peer_conn_id);
-        state.task_to_question.insert(task_id.clone(), q_id.clone());
-        state.busy_peers.insert(peer_conn_id);
-
-        let pending = PendingQuestion {
+        state.task_queue.push_front(QueuedQuestion {
             question_id: q_id.clone(),
             questioner_conn_id: 0,
             text: String::new(),
-            messages: messages.clone(),
-            task_peers,
-            results: Vec::new(),
-            expected_results: 1,
-            arbiter_task_id: None,
-            arbiter_conn_id: None,
-            start: Instant::now(),
-            phase: QuestionPhase::Generating,
+            messages,
             is_time_task: true,
-        };
-        state.questions.insert(q_id.clone(), pending);
+        });
+        let queue_len = state.queue_len();
         drop(state);
 
-        let line = hlog::task_assigned(&task_id, &peer_info.peer_id, &peer_info.model, &peer_info.tier);
+        let line = hlog::task_queued(&q_id, queue_len);
         self.emit(&line).await;
-
-        let task = HubMsg::Task {
-            task_id,
-            question_id: None,
-            system,
-            messages,
-            max_tokens: 128,
-        };
-        self.send_to(peer_conn_id, &task).await;
-
-        // 30s timeout
-        let hub = Arc::clone(self);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            hub.handle_timeout(&q_id).await;
-        });
     }
 
     async fn emit_stats(&self) {
