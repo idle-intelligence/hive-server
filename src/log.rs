@@ -9,7 +9,11 @@ pub fn ts() -> String {
 }
 
 pub fn peer_joined(peer_id: &str, model: &str, tier: &str, tok_s: f64) -> String {
-    format!("{} [peer] {} joined ({}, {}, {:.1} tok/s)", ts(), peer_id, model, tier, tok_s)
+    if tier == "carrier" {
+        format!("{} [peer] {} joined ({}, {}, {:.1} tok/s) — Carrier has arrived.", ts(), peer_id, model, tier, tok_s)
+    } else {
+        format!("{} [peer] {} joined ({}, {}, {:.1} tok/s)", ts(), peer_id, model, tier, tok_s)
+    }
 }
 
 pub fn peer_left(peer_id: &str, reason: &str) -> String {
@@ -70,6 +74,10 @@ pub fn queue_dispatch(q_id: &str, queue_len: usize) -> String {
     format!("{} [queue] {} dispatched ({} remaining)", ts(), q_id, queue_len)
 }
 
+pub fn arbiter_queued(q_id: &str, queue_len: usize) -> String {
+    format!("{} [queue] {} awaiting arbiter ({} in queue)", ts(), q_id, queue_len)
+}
+
 pub fn queue_full(q_id: &str) -> String {
     format!("{} [queue] {} rejected — queue full", ts(), q_id)
 }
@@ -78,26 +86,26 @@ pub fn swarm_status(peer_count: usize) -> String {
     format!("{} [swarm] {} peer(s) connected", ts(), peer_count)
 }
 
-pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, spectators: usize, questions_today: u64, total_flops: f64) -> String {
-    let mut carrier = 0u32;
-    let mut drone = 0u32;
-    let mut probe = 0u32;
+pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: usize, questions_today: u64, total_flops: f64) -> String {
+    let mut n_carrier = 0u32;
+    let mut n_drone = 0u32;
+    let mut n_probe_tier = 0u32;
     let mut total_tok_s = 0.0;
 
     for peer in peers.values() {
         match peer.tier.as_str() {
-            "carrier" => carrier += 1,
-            "drone" => drone += 1,
-            _ => probe += 1,
+            "carrier" => n_carrier += 1,
+            "drone" => n_drone += 1,
+            _ => n_probe_tier += 1,
         }
         total_tok_s += peer.tok_s;
     }
 
     let total = peers.len();
     let mut tiers = Vec::new();
-    if carrier > 0 { tiers.push(format!("{carrier} carrier")); }
-    if drone > 0 { tiers.push(format!("{drone} drone")); }
-    if probe > 0 { tiers.push(format!("{probe} probe")); }
+    if n_carrier > 0 { tiers.push(format!("{n_carrier} carrier")); }
+    if n_drone > 0 { tiers.push(format!("{n_drone} drone")); }
+    if n_probe_tier > 0 { tiers.push(format!("{n_probe_tier} probe")); }
     let tier_str = if tiers.is_empty() {
         String::new()
     } else {
@@ -105,7 +113,7 @@ pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, spectators: usize, question
     };
 
     format!(
-        "{} [swarm] {} peers{}, {} spectators | {:.1} tok/s | {} questions | {:.2e} total FLOPS",
-        ts(), total, tier_str, spectators, total_tok_s, questions_today, total_flops
+        "{} [swarm] {} peers{}, {} probes, {} observers | {:.1} tok/s | {} questions | {:.2e} total FLOPS",
+        ts(), total, tier_str, probes, observers, total_tok_s, questions_today, total_flops
     )
 }

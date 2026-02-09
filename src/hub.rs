@@ -19,6 +19,7 @@ use crate::state::{HubState, PeerInfo, PendingQuestion, QueuedQuestion, Question
 /// SmolLM2 1.7B ≈ 1.7B params × 2 ops/param = 3.4 GFLOPS per token
 const FLOPS_PER_TOKEN: f64 = 3.4e9;
 
+
 type Tx = futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>;
 
 static NEXT_CONN_ID: AtomicUsize = AtomicUsize::new(1);
@@ -122,17 +123,21 @@ impl Hub {
 
     // ── Question routing ────────────────────────────────────────────
 
-    async fn handle_question(self: &Arc<Self>, questioner_conn_id: usize, text: String, messages: Vec<crate::protocol::ChatMessage>) {
+    async fn handle_question(self: &Arc<Self>, probe_conn_id: usize, text: String, messages: Vec<crate::protocol::ChatMessage>) {
         let q_id = format!("q_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
         let line = hlog::question_received(&q_id, &text);
         self.emit(&line).await;
 
         {
-            self.state.lock().await.questions_today += 1;
+            let mut state = self.state.lock().await;
+            state.questions_today += 1;
+            if !state.peers.contains_key(&probe_conn_id) {
+                state.probes.insert(probe_conn_id);
+            }
         }
 
-        if self.route_question(&q_id, questioner_conn_id, &text, &messages, false).await {
+        if self.route_question(&q_id, probe_conn_id, &text, &messages, false).await {
             return;
         }
 
@@ -143,15 +148,16 @@ impl Hub {
             let line = hlog::queue_full(&q_id);
             self.emit(&line).await;
             let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
-            self.send_to(questioner_conn_id, &err).await;
+            self.send_to(probe_conn_id, &err).await;
             return;
         }
         state.task_queue.push_back(QueuedQuestion {
             question_id: q_id.clone(),
-            questioner_conn_id,
+            probe_conn_id,
             text: text.clone(),
             messages: messages.clone(),
             is_time_task: false,
+            arbitration_for: None,
         });
         let queue_len = state.queue_len();
         drop(state);
@@ -164,7 +170,7 @@ impl Hub {
     async fn route_question(
         self: &Arc<Self>,
         q_id: &str,
-        questioner_conn_id: usize,
+        probe_conn_id: usize,
         text: &str,
         messages: &[crate::protocol::ChatMessage],
         is_time_task: bool,
@@ -172,7 +178,7 @@ impl Hub {
         let mut state = self.state.lock().await;
 
         let mut exclude = state.busy_peers.clone();
-        exclude.insert(questioner_conn_id);
+        exclude.insert(probe_conn_id);
         let selected = router::select_peers(&state.peers, &exclude, if is_time_task { 1 } else { 3 });
 
         if selected.is_empty() {
@@ -191,15 +197,11 @@ impl Hub {
             tasks_to_send.push((task_id, *conn_id, peer_info.clone()));
         }
 
-        let (system, max_tokens) = if is_time_task {
-            ("You are a drone in a distributed swarm of language models. You will be told the current time. Rewrite it naturally in your own words, then add a brief observation. Write it as a single flowing sentence. Do not use JSON. Do not repeat the exact format you were given.".to_string(), 64)
-        } else {
-            ("Answer the following question concisely and accurately.".to_string(), 256)
-        };
+        let max_tokens: u32 = if is_time_task { 64 } else { 128 };
 
         let pending = PendingQuestion {
             question_id: q_id.to_string(),
-            questioner_conn_id,
+            probe_conn_id,
             text: text.to_string(),
             messages: messages.to_vec(),
             task_peers,
@@ -217,10 +219,15 @@ impl Hub {
         let question_id_for_msg = if is_time_task { None } else { Some(q_id.to_string()) };
 
         for (task_id, conn_id, peer_info) in &tasks_to_send {
+            let system = if is_time_task {
+                format!("You are a {} in a distributed swarm of language models. You will be told the current time. Rewrite it naturally in your own words, then add a brief observation. Write it as a single flowing sentence. Do not use JSON. Do not repeat the exact format you were given.", tier_label(&peer_info.tier))
+            } else {
+                format!("You are a {} \u{2014} one node in a distributed swarm of small language models running in browser tabs around the world. You are answering a question alongside other peers \u{2014} an arbiter will pick the best answer.\n\nBe concise. One to three sentences unless the question genuinely requires more. Do not make up URLs, commands, or specific numbers you aren\u{2019}t sure about. If you don\u{2019}t know, say so briefly.", tier_label(&peer_info.tier))
+            };
             let task = HubMsg::Task {
                 task_id: task_id.clone(),
                 question_id: question_id_for_msg.clone(),
-                system: system.clone(),
+                system,
                 messages: messages.to_vec(),
                 max_tokens,
             };
@@ -233,7 +240,7 @@ impl Hub {
         let hub = Arc::clone(self);
         let q_id_owned = q_id.to_string();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::time::sleep(Duration::from_secs(12)).await;
             hub.handle_timeout(&q_id_owned).await;
         });
 
@@ -260,19 +267,29 @@ impl Hub {
             let line = hlog::queue_dispatch(&queued.question_id, self.state.lock().await.queue_len());
             self.emit(&line).await;
 
-            let dispatched = self.route_question(
-                &queued.question_id,
-                queued.questioner_conn_id,
-                &queued.text,
-                &queued.messages,
-                queued.is_time_task,
-            ).await;
+            if let Some(ref q_id) = queued.arbitration_for {
+                // Arbiter retry — try_assign_arbiter has stricter exclusions,
+                // so it may fail even though an idle peer exists. Re-queue and stop.
+                if !self.try_assign_arbiter(q_id).await {
+                    let mut state = self.state.lock().await;
+                    state.task_queue.push_front(queued);
+                    break;
+                }
+            } else {
+                let dispatched = self.route_question(
+                    &queued.question_id,
+                    queued.probe_conn_id,
+                    &queued.text,
+                    &queued.messages,
+                    queued.is_time_task,
+                ).await;
 
-            if !dispatched {
-                // Race: peer got busy between check and route. Re-queue at front and stop.
-                let mut state = self.state.lock().await;
-                state.task_queue.push_front(queued);
-                break;
+                if !dispatched {
+                    // Race: peer got busy between check and route. Re-queue at front and stop.
+                    let mut state = self.state.lock().await;
+                    state.task_queue.push_front(queued);
+                    break;
+                }
             }
         }
     }
@@ -350,7 +367,7 @@ impl Hub {
             let total_tokens: u32 =
                 question.results.iter().map(|r| r.tokens).sum::<u32>() + result.tokens;
             let peers_used = candidates as u32 + 1;
-            let questioner = question.questioner_conn_id;
+            let probe = question.probe_conn_id;
             let q_id = question_id.clone();
             question.phase = QuestionPhase::Done;
             drop(state);
@@ -371,7 +388,7 @@ impl Hub {
                 total_ms: elapsed_ms,
                 peers_used,
             };
-            self.send_to(questioner, &answer).await;
+            self.send_to(probe, &answer).await;
             return;
         }
 
@@ -400,7 +417,7 @@ impl Hub {
         if question.expected_results <= 2 {
             let first = question.results[0].clone();
             let elapsed_ms = question.start.elapsed().as_millis() as u64;
-            let questioner = question.questioner_conn_id;
+            let probe = question.probe_conn_id;
             let q_id = question_id.clone();
             let peers_used = question.expected_results as u32;
             question.phase = QuestionPhase::Done;
@@ -418,39 +435,63 @@ impl Hub {
                 total_ms: elapsed_ms,
                 peers_used,
             };
-            self.send_to(questioner, &answer).await;
+            self.send_to(probe, &answer).await;
         } else if question.results.len() >= question.expected_results {
             // All 3 results collected — proceed to arbitration
             let q_id = question_id.clone();
             drop(state);
-            self.proceed_to_arbitration(&q_id).await;
+
+            if !self.try_assign_arbiter(&q_id).await {
+                // No arbiter available — queue at front, timeout is the safety net
+                let mut state = self.state.lock().await;
+                if let Some(q) = state.questions.get_mut(&q_id) {
+                    if q.phase == QuestionPhase::Generating {
+                        q.phase = QuestionPhase::Arbitrating;
+                    }
+                }
+                // Arbiter tasks always queue (ignore backpressure)
+                state.task_queue.push_front(QueuedQuestion {
+                    question_id: q_id.clone(),
+                    probe_conn_id: 0,
+                    text: String::new(),
+                    messages: Vec::new(),
+                    is_time_task: false,
+                    arbitration_for: Some(q_id.clone()),
+                });
+                let queue_len = state.queue_len();
+                drop(state);
+
+                let line = hlog::arbiter_queued(&q_id, queue_len);
+                self.emit(&line).await;
+            }
         }
     }
 
     // ── Arbiter ──────────────────────────────────────────────────────
 
-    async fn proceed_to_arbitration(self: &Arc<Self>, question_id: &str) {
+    /// Try to assign an arbiter for a question. Returns true if assigned, false if no peer available.
+    async fn try_assign_arbiter(self: &Arc<Self>, question_id: &str) -> bool {
         let mut state = self.state.lock().await;
 
-        // Check phase first
+        // Accept Generating (first attempt) or Arbitrating with no arbiter yet (retry from queue)
         let question = match state.questions.get(question_id) {
             Some(q) if q.phase == QuestionPhase::Generating => q,
-            _ => return,
+            Some(q) if q.phase == QuestionPhase::Arbitrating && q.arbiter_task_id.is_none() => q,
+            _ => return true, // Already handled (Done, or arbiter already assigned)
         };
 
         // Extract data we need while holding an immutable borrow
         let gen_conn_ids: Vec<usize> = question.task_peers.values().cloned().collect();
         let q_text = question.text.clone();
         let results_snapshot: Vec<TaskResult> = question.results.clone();
-        let questioner = question.questioner_conn_id;
-        let start = question.start;
+        let probe = question.probe_conn_id;
 
-        // Build exclude set: generation peers + busy peers + questioner
+        // Build exclude set: generation peers + busy peers + probe
         let mut exclude = state.busy_peers.clone();
         for &conn_id in &gen_conn_ids {
             exclude.insert(conn_id);
         }
-        exclude.insert(questioner);
+        exclude.insert(probe);
 
         let arbiters = router::select_peers(&state.peers, &exclude, 1);
 
@@ -492,36 +533,9 @@ impl Hub {
                 max_tokens: 8,
             };
             self.send_to(arbiter_conn_id, &task).await;
+            true
         } else {
-            // No arbiter available — return first result
-            let first = results_snapshot[0].clone();
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-            let q_id = question_id.to_string();
-            let peers_used = results_snapshot.len() as u32;
-
-            let question = state.questions.get_mut(question_id).unwrap();
-            question.phase = QuestionPhase::Done;
-            drop(state);
-
-            let line = format!(
-                "{} [error] no arbiter available for {}, returning first response",
-                hlog::ts(), q_id
-            );
-            self.emit(&line).await;
-
-            let total_secs = elapsed_ms as f64 / 1000.0;
-            let line = hlog::answer_delivered(&q_id, first.tokens, total_secs, peers_used);
-            self.emit(&line).await;
-
-            let answer = HubMsg::Answer {
-                question_id: q_id,
-                text: first.text,
-                peer_id: first.peer_id,
-                total_tokens: first.tokens,
-                total_ms: elapsed_ms,
-                peers_used,
-            };
-            self.send_to(questioner, &answer).await;
+            false
         }
     }
 
@@ -537,7 +551,7 @@ impl Hub {
         match question.phase {
             QuestionPhase::Generating => {
                 if question.results.is_empty() {
-                    let questioner = question.questioner_conn_id;
+                    let probe = question.probe_conn_id;
                     let q_id = question_id.to_string();
                     question.phase = QuestionPhase::Done;
                     drop(state);
@@ -549,19 +563,53 @@ impl Hub {
                     self.emit(&line).await;
 
                     let err = HubMsg::Error { text: "All peers timed out".to_string() };
-                    self.send_to(questioner, &err).await;
+                    self.send_to(probe, &err).await;
                 } else {
                     // Got some results — try to arbitrate with what we have
                     let q_id = question_id.to_string();
                     drop(state);
-                    self.proceed_to_arbitration(&q_id).await;
+
+                    if !self.try_assign_arbiter(&q_id).await {
+                        // Timed out and no arbiter — deliver first result
+                        let mut state = self.state.lock().await;
+                        let question = match state.questions.get_mut(&q_id) {
+                            Some(q) if q.phase != QuestionPhase::Done => q,
+                            _ => return,
+                        };
+                        let first = question.results[0].clone();
+                        let elapsed_ms = question.start.elapsed().as_millis() as u64;
+                        let probe = question.probe_conn_id;
+                        let peers_used = question.results.len() as u32;
+                        question.phase = QuestionPhase::Done;
+                        drop(state);
+
+                        let line = format!(
+                            "{} [error] timed out for {}, no arbiter, returning first response",
+                            hlog::ts(), q_id
+                        );
+                        self.emit(&line).await;
+
+                        let total_secs = elapsed_ms as f64 / 1000.0;
+                        let line = hlog::answer_delivered(&q_id, first.tokens, total_secs, peers_used);
+                        self.emit(&line).await;
+
+                        let answer = HubMsg::Answer {
+                            question_id: q_id,
+                            text: first.text,
+                            peer_id: first.peer_id,
+                            total_tokens: first.tokens,
+                            total_ms: elapsed_ms,
+                            peers_used,
+                        };
+                        self.send_to(probe, &answer).await;
+                    }
                 }
             }
             QuestionPhase::Arbitrating => {
                 // Arbiter timed out — deliver first result
                 let first = question.results[0].clone();
                 let elapsed_ms = question.start.elapsed().as_millis() as u64;
-                let questioner = question.questioner_conn_id;
+                let probe = question.probe_conn_id;
                 let q_id = question_id.to_string();
                 let peers_used = question.results.len() as u32;
                 question.phase = QuestionPhase::Done;
@@ -585,7 +633,7 @@ impl Hub {
                     total_ms: elapsed_ms,
                     peers_used,
                 };
-                self.send_to(questioner, &answer).await;
+                self.send_to(probe, &answer).await;
             }
             QuestionPhase::Done => {}
         }
@@ -654,10 +702,11 @@ impl Hub {
         }
         state.task_queue.push_front(QueuedQuestion {
             question_id: q_id.clone(),
-            questioner_conn_id: 0,
+            probe_conn_id: 0,
             text: String::new(),
             messages,
             is_time_task: true,
+            arbitration_for: None,
         });
         let queue_len = state.queue_len();
         drop(state);
@@ -672,8 +721,10 @@ impl Hub {
             return;
         }
         let total_conns = self.senders.lock().await.len();
-        let spectators = total_conns.saturating_sub(state.peers.len());
-        let line = hlog::swarm_stats(&state.peers, spectators, state.questions_today, state.total_flops);
+        let non_peers = total_conns.saturating_sub(state.peers.len());
+        let probes = state.probes.len();
+        let observers = non_peers.saturating_sub(probes);
+        let line = hlog::swarm_stats(&state.peers, probes, observers, state.questions_today, state.total_flops);
         drop(state);
         self.emit(&line).await;
     }
@@ -709,6 +760,14 @@ impl Hub {
                 senders.remove(&conn_id);
             }
         }
+    }
+}
+
+fn tier_label(tier: &str) -> &'static str {
+    match tier {
+        "carrier" => "carrier",
+        "drone" => "drone",
+        _ => "probe",
     }
 }
 

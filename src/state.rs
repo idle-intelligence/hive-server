@@ -31,7 +31,7 @@ pub enum QuestionPhase {
 #[derive(Debug)]
 pub struct PendingQuestion {
     pub question_id: String,
-    pub questioner_conn_id: usize,
+    pub probe_conn_id: usize,
     pub text: String,
     pub messages: Vec<crate::protocol::ChatMessage>,
     /// task_id → conn_id for generation tasks
@@ -48,10 +48,12 @@ pub struct PendingQuestion {
 #[derive(Debug)]
 pub struct QueuedQuestion {
     pub question_id: String,
-    pub questioner_conn_id: usize,
+    pub probe_conn_id: usize,
     pub text: String,
     pub messages: Vec<crate::protocol::ChatMessage>,
     pub is_time_task: bool,
+    /// If Some, this queue entry is waiting for an arbiter, not generation.
+    pub arbitration_for: Option<String>,
 }
 
 const MAX_QUEUE_LEN: usize = 20;
@@ -62,6 +64,7 @@ pub struct HubState {
     pub questions: HashMap<String, PendingQuestion>,
     pub task_to_question: HashMap<String, String>,
     pub busy_peers: HashSet<usize>,
+    pub probes: HashSet<usize>,
     pub task_queue: VecDeque<QueuedQuestion>,
     pub questions_today: u64,
     pub total_flops: f64,
@@ -74,6 +77,7 @@ impl HubState {
             questions: HashMap::new(),
             task_to_question: HashMap::new(),
             busy_peers: HashSet::new(),
+            probes: HashSet::new(),
             task_queue: VecDeque::new(),
             questions_today: 0,
             total_flops: 0.0,
@@ -86,6 +90,7 @@ impl HubState {
 
     pub fn remove_peer(&mut self, conn_id: usize) -> Option<PeerInfo> {
         self.busy_peers.remove(&conn_id);
+        self.probes.remove(&conn_id);
         self.peers.remove(&conn_id)
     }
 
