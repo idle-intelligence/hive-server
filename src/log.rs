@@ -83,7 +83,7 @@ pub fn queue_full(q_id: &str) -> String {
 }
 
 pub fn swarm_status(peer_count: usize) -> String {
-    format!("{} [swarm] {} peer(s) connected", ts(), peer_count)
+    format!("{} [swarm] {} Peer connected", ts(), peer_count)
 }
 
 pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: usize, questions_today: u64, total_flops: f64) -> String {
@@ -103,9 +103,9 @@ pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: u
 
     let total = peers.len();
     let mut tiers = Vec::new();
-    if n_carrier > 0 { tiers.push(format!("{n_carrier} carrier")); }
-    if n_drone > 0 { tiers.push(format!("{n_drone} drone")); }
-    if n_probe_tier > 0 { tiers.push(format!("{n_probe_tier} probe")); }
+    if n_carrier > 0 { tiers.push(format!("{n_carrier} Carrier")); }
+    if n_drone > 0 { tiers.push(format!("{n_drone} Drone")); }
+    if n_probe_tier > 0 { tiers.push(format!("{n_probe_tier} Probe")); }
     let tier_str = if tiers.is_empty() {
         String::new()
     } else {
@@ -113,7 +113,7 @@ pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: u
     };
 
     format!(
-        "{} [swarm] {} peers{}, {} probes, {} observers | {:.1} tok/s | {} questions | {:.2e} total FLOPS",
+        "{} [swarm] {} Peer{}, {} Probe, {} Observer | {:.1} tok/s | {} Question | {:.2e} total FLOPS",
         ts(), total, tier_str, probes, observers, total_tok_s, questions_today, total_flops
     )
 }
