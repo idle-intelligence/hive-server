@@ -43,6 +43,7 @@ pub enum HubMsg {
         task_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         question_id: Option<String>,
+        task_type: String,
         system: String,
         messages: Vec<ChatMessage>,
         max_tokens: u32,

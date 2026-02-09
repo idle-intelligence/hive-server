@@ -83,6 +83,18 @@ pub fn queue_full(q_id: &str) -> String {
     format!("{} [queue] {} rejected — queue full", ts(), q_id)
 }
 
+pub fn archivist_queued(q_id: &str, queue_len: usize) -> String {
+    format!("{} [queue] archivist for {} queued ({} in low queue)", ts(), q_id, queue_len)
+}
+
+pub fn archivist_result(task_id: &str, peer_id: &str, text: &str, tokens: u32, secs: f64) -> String {
+    let text = text.trim();
+    format!(
+        "{} [archivist {}] {} — \"{}\" ({} tok, {:.1}s)",
+        ts(), task_id, peer_id, text, tokens, secs
+    )
+}
+
 pub fn swarm_status(peer_count: usize) -> String {
     format!("{} [swarm] {} Peer connected", ts(), peer_count)
 }

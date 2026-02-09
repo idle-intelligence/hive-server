@@ -14,7 +14,7 @@ use tokio_tungstenite::WebSocketStream;
 use crate::log as hlog;
 use crate::protocol::{ChatMessage, ClientMsg, HubMsg};
 use crate::router;
-use crate::state::{HubState, PeerInfo, PendingQuestion, QueuedQuestion, QuestionPhase, TaskResult};
+use crate::state::{HubState, PeerInfo, PendingQuestion, QueuedQuestion, QuestionPhase, TaskResult, TaskType};
 
 /// SmolLM2 1.7B ≈ 1.7B params × 2 ops/param = 3.4 GFLOPS per token
 const FLOPS_PER_TOKEN: f64 = 3.4e9;
@@ -137,13 +137,13 @@ impl Hub {
             }
         }
 
-        if self.route_question(&q_id, probe_conn_id, &text, &messages, false).await {
+        if self.route_question(&q_id, probe_conn_id, &text, &messages, TaskType::Answer).await {
             return;
         }
 
         // No peers available — try to queue
         let mut state = self.state.lock().await;
-        if state.queue_full() {
+        if state.normal_queue_full() {
             drop(state);
             let line = hlog::queue_full(&q_id);
             self.emit(&line).await;
@@ -151,12 +151,12 @@ impl Hub {
             self.send_to(probe_conn_id, &err).await;
             return;
         }
-        state.task_queue.push_back(QueuedQuestion {
+        state.normal_queue.push_back(QueuedQuestion {
             question_id: q_id.clone(),
             probe_conn_id,
             text: text.clone(),
             messages: messages.clone(),
-            is_time_task: false,
+            task_type: TaskType::Answer,
             arbitration_for: None,
         });
         let queue_len = state.queue_len();
@@ -173,21 +173,35 @@ impl Hub {
         probe_conn_id: usize,
         text: &str,
         messages: &[crate::protocol::ChatMessage],
-        is_time_task: bool,
+        task_type: TaskType,
     ) -> bool {
         let mut state = self.state.lock().await;
 
         let mut exclude = state.busy_peers.clone();
         exclude.insert(probe_conn_id);
-        let selected = router::select_peers(&state.peers, &exclude, if is_time_task { 1 } else { 3 });
+        let (n_peers, prefer_tier) = match task_type {
+            TaskType::Answer => (3, Some("drone")),
+            TaskType::Time | TaskType::Archivist => (1, None),
+            TaskType::Arbiter => unreachable!(),
+        };
+        let selected = router::select_peers(&state.peers, &exclude, n_peers, prefer_tier);
 
         if selected.is_empty() {
             return false;
         }
 
         let n = selected.len();
-        let task_id = format!("task_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let max_tokens: u32 = if is_time_task { 64 } else { 128 };
+        let task_id_prefix = match task_type {
+            TaskType::Archivist => "arch",
+            _ => "task",
+        };
+        let task_id = format!("{}_{}", task_id_prefix, &uuid::Uuid::new_v4().to_string()[..8]);
+        let max_tokens: u32 = match task_type {
+            TaskType::Answer => 128,
+            TaskType::Time => 64,
+            TaskType::Archivist => 80,
+            TaskType::Arbiter => unreachable!(),
+        };
 
         let mut gen_peers = Vec::new();
         let mut peers_to_send: Vec<(usize, PeerInfo)> = Vec::new();
@@ -213,7 +227,7 @@ impl Hub {
             arbiter_conn_id: None,
             start: Instant::now(),
             phase: QuestionPhase::Generating,
-            is_time_task,
+            task_type,
         };
         state.questions.insert(q_id.to_string(), pending);
         drop(state);
@@ -223,17 +237,28 @@ impl Hub {
         let line = hlog::task_assigned(&task_id, &peer_ids);
         self.emit(&line).await;
 
-        let question_id_for_msg = if is_time_task { None } else { Some(q_id.to_string()) };
+        let question_id_for_msg = match task_type {
+            TaskType::Answer => Some(q_id.to_string()),
+            _ => None,
+        };
 
         for (conn_id, peer_info) in &peers_to_send {
-            let system = if is_time_task {
-                format!("You are a {} in a distributed swarm of language models. You will be told the current time. Rewrite it naturally in your own words, then add a brief observation. Write it as a single flowing sentence. Do not use JSON. Do not repeat the exact format you were given.", tier_label(&peer_info.tier))
-            } else {
-                format!("You are a {} \u{2014} one node in a distributed swarm of small language models running in browser tabs around the world. You are answering a question alongside other peers \u{2014} an arbiter will pick the best answer.\n\nBe concise. One to three sentences unless the question genuinely requires more. Do not make up URLs, commands, or specific numbers you aren\u{2019}t sure about. If you don\u{2019}t know, say so briefly.", tier_label(&peer_info.tier))
+            let system = match task_type {
+                TaskType::Answer => format!(
+                    "You are a {} \u{2014} one node in a distributed swarm of small language models running in browser tabs around the world. You are answering a question alongside other peers \u{2014} an arbiter will pick the best answer.\n\nBe concise. One to three sentences unless the question genuinely requires more. Do not make up URLs, commands, or specific numbers you aren\u{2019}t sure about. If you don\u{2019}t know, say so briefly.",
+                    tier_label(&peer_info.tier)
+                ),
+                TaskType::Time => format!(
+                    "You are a {} in a distributed swarm of language models. You will be told the current time. Rewrite it naturally in your own words, then add a brief observation. Write it as a single flowing sentence. Do not use JSON. Do not repeat the exact format you were given.",
+                    tier_label(&peer_info.tier)
+                ),
+                TaskType::Archivist => "You categorize and summarize question-answer pairs for a distributed AI swarm.\n\nCategories (pick exactly one):\ntech, science, history, literature, music, art, finance, philosophy, language, life, swarm\n\nRespond with ONLY this JSON, nothing else:\n{\"category\": \"...\", \"tags\": [\"...\", \"...\"], \"summary\": \"...\"}\n\nRules:\n- category: exactly one from the list above\n- tags: 1-2 lowercase tags, hyphenated if multi-word\n- summary: one sentence describing what was asked and answered".to_string(),
+                TaskType::Arbiter => unreachable!(),
             };
             let task = HubMsg::Task {
                 task_id: task_id.clone(),
                 question_id: question_id_for_msg.clone(),
+                task_type: task_type.as_str().to_string(),
                 system,
                 messages: messages.to_vec(),
                 max_tokens,
@@ -258,14 +283,17 @@ impl Hub {
         loop {
             let queued = {
                 let mut state = self.state.lock().await;
-                // Peek: is there anything in the queue and any idle peer?
                 let has_idle = state.peers.keys().any(|id| !state.busy_peers.contains(id));
                 if !has_idle {
                     break;
                 }
-                match state.task_queue.pop_front() {
-                    Some(q) => q,
-                    None => break,
+                // Normal queue has priority over low queue
+                if let Some(q) = state.normal_queue.pop_front() {
+                    q
+                } else if let Some(q) = state.low_queue.pop_front() {
+                    q
+                } else {
+                    break;
                 }
             };
 
@@ -273,11 +301,9 @@ impl Hub {
             self.emit(&line).await;
 
             if let Some(ref q_id) = queued.arbitration_for {
-                // Arbiter retry — try_assign_arbiter has stricter exclusions,
-                // so it may fail even though an idle peer exists. Re-queue and stop.
                 if !self.try_assign_arbiter(q_id).await {
                     let mut state = self.state.lock().await;
-                    state.task_queue.push_front(queued);
+                    state.normal_queue.push_front(queued);
                     break;
                 }
             } else {
@@ -286,13 +312,15 @@ impl Hub {
                     queued.probe_conn_id,
                     &queued.text,
                     &queued.messages,
-                    queued.is_time_task,
+                    queued.task_type,
                 ).await;
 
                 if !dispatched {
-                    // Race: peer got busy between check and route. Re-queue at front and stop.
                     let mut state = self.state.lock().await;
-                    state.task_queue.push_front(queued);
+                    match queued.task_type {
+                        TaskType::Answer | TaskType::Arbiter => state.normal_queue.push_front(queued),
+                        TaskType::Time | TaskType::Archivist => state.low_queue.push_front(queued),
+                    }
                     break;
                 }
             }
@@ -374,6 +402,7 @@ impl Hub {
             let peers_used = candidates as u32 + 1;
             let probe = question.probe_conn_id;
             let q_id = question_id.clone();
+            let q_text = question.text.clone();
             question.phase = QuestionPhase::Done;
             drop(state);
 
@@ -385,8 +414,9 @@ impl Hub {
             let line = hlog::answer_delivered(&q_id, total_tokens, total_secs, peers_used);
             self.emit(&line).await;
 
+            let answer_text = picked_result.text.clone();
             let answer = HubMsg::Answer {
-                question_id: q_id,
+                question_id: q_id.clone(),
                 text: picked_result.text,
                 peer_id: picked_result.peer_id,
                 total_tokens,
@@ -394,6 +424,7 @@ impl Hub {
                 peers_used,
             };
             self.send_to(probe, &answer).await;
+            self.queue_archivist(&q_id, &q_text, &answer_text).await;
             return;
         }
 
@@ -405,7 +436,7 @@ impl Hub {
         question.results.push(result);
 
         // Time task: emit [time] log and accumulate FLOPS
-        if question.is_time_task {
+        if question.task_type == TaskType::Time {
             let first = question.results[0].clone();
             let flops = first.tokens as f64 * FLOPS_PER_TOKEN;
             question.phase = QuestionPhase::Done;
@@ -418,12 +449,25 @@ impl Hub {
             return;
         }
 
+        // Archivist task: log result and done
+        if question.task_type == TaskType::Archivist {
+            let first = question.results[0].clone();
+            question.phase = QuestionPhase::Done;
+            drop(state);
+
+            let secs = first.inference_ms as f64 / 1000.0;
+            let line = hlog::archivist_result(&first.task_id, &first.peer_id, &first.text, first.tokens, secs);
+            self.emit(&line).await;
+            return;
+        }
+
         // Degraded mode (1-2 peers): deliver first result immediately
         if question.expected_results <= 2 {
             let first = question.results[0].clone();
             let elapsed_ms = question.start.elapsed().as_millis() as u64;
             let probe = question.probe_conn_id;
             let q_id = question_id.clone();
+            let q_text = question.text.clone();
             let peers_used = question.expected_results as u32;
             question.phase = QuestionPhase::Done;
             drop(state);
@@ -432,8 +476,9 @@ impl Hub {
             let line = hlog::answer_delivered(&q_id, first.tokens, total_secs, peers_used);
             self.emit(&line).await;
 
+            let answer_text = first.text.clone();
             let answer = HubMsg::Answer {
-                question_id: q_id,
+                question_id: q_id.clone(),
                 text: first.text,
                 peer_id: first.peer_id,
                 total_tokens: first.tokens,
@@ -441,6 +486,7 @@ impl Hub {
                 peers_used,
             };
             self.send_to(probe, &answer).await;
+            self.queue_archivist(&q_id, &q_text, &answer_text).await;
         } else if question.results.len() >= question.expected_results {
             // All 3 results collected — proceed to arbitration
             let q_id = question_id.clone();
@@ -455,12 +501,12 @@ impl Hub {
                     }
                 }
                 // Arbiter tasks always queue (ignore backpressure)
-                state.task_queue.push_front(QueuedQuestion {
+                state.normal_queue.push_front(QueuedQuestion {
                     question_id: q_id.clone(),
                     probe_conn_id: 0,
                     text: String::new(),
                     messages: Vec::new(),
-                    is_time_task: false,
+                    task_type: TaskType::Arbiter,
                     arbitration_for: Some(q_id.clone()),
                 });
                 let queue_len = state.queue_len();
@@ -498,7 +544,7 @@ impl Hub {
         }
         exclude.insert(probe);
 
-        let arbiters = router::select_peers(&state.peers, &exclude, 1);
+        let arbiters = router::select_peers(&state.peers, &exclude, 1, Some("carrier"));
 
         if let Some((arbiter_conn_id, arbiter_info)) = arbiters.into_iter().next() {
             let arbiter_task_id = format!("arb_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -533,6 +579,7 @@ impl Hub {
             let task = HubMsg::Task {
                 task_id: arbiter_task_id,
                 question_id: Some(question_id.to_string()),
+                task_type: "arbiter".to_string(),
                 system: "You are an arbiter in a distributed swarm of language models. You will receive a question and several candidate answers from other nodes. Pick the best one.\n\nRespond with ONLY the number of the best answer. Nothing else.".to_string(),
                 messages: arbiter_messages,
                 max_tokens: 8,
@@ -552,6 +599,12 @@ impl Hub {
             Some(q) if q.phase != QuestionPhase::Done => q,
             _ => return,
         };
+
+        // Non-answer tasks (time, archivist) just get silently dropped on timeout
+        if question.task_type != TaskType::Answer {
+            question.phase = QuestionPhase::Done;
+            return;
+        }
 
         match question.phase {
             QuestionPhase::Generating => {
@@ -693,24 +746,24 @@ impl Hub {
             content: format!("Current time: {readable}"),
         }];
 
-        if self.route_question(&q_id, 0, "", &messages, true).await {
+        if self.route_question(&q_id, 0, "", &messages, TaskType::Time).await {
             return;
         }
 
-        // No peers — try to queue at front (time tasks get priority)
+        // No peers — try to queue in low queue
         let mut state = self.state.lock().await;
-        if state.queue_full() {
+        if state.low_queue_full() {
             drop(state);
             let line = hlog::time_skipped();
             self.emit(&line).await;
             return;
         }
-        state.task_queue.push_front(QueuedQuestion {
+        state.low_queue.push_back(QueuedQuestion {
             question_id: q_id.clone(),
             probe_conn_id: 0,
             text: String::new(),
             messages,
-            is_time_task: true,
+            task_type: TaskType::Time,
             arbitration_for: None,
         });
         let queue_len = state.queue_len();
@@ -731,6 +784,34 @@ impl Hub {
         let observers = non_peers.saturating_sub(probes);
         let line = hlog::swarm_stats(&state.peers, probes, observers, state.questions_today, state.total_flops);
         drop(state);
+        self.emit(&line).await;
+    }
+
+    // ── Archivist ─────────────────────────────────────────────────────
+
+    async fn queue_archivist(self: &Arc<Self>, question_id: &str, question_text: &str, answer_text: &str) {
+        let arch_id = format!("arch_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: format!("Question: {}\nAnswer: {}", question_text, answer_text),
+        }];
+
+        let mut state = self.state.lock().await;
+        if state.low_queue_full() {
+            return; // silently drop
+        }
+        state.low_queue.push_back(QueuedQuestion {
+            question_id: arch_id,
+            probe_conn_id: 0,
+            text: String::new(),
+            messages,
+            task_type: TaskType::Archivist,
+            arbitration_for: None,
+        });
+        let queue_len = state.low_queue.len();
+        drop(state);
+
+        let line = hlog::archivist_queued(question_id, queue_len);
         self.emit(&line).await;
     }
 

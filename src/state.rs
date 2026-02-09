@@ -1,6 +1,25 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TaskType {
+    Answer,
+    Arbiter,
+    Time,
+    Archivist,
+}
+
+impl TaskType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskType::Answer => "answer",
+            TaskType::Arbiter => "arbiter",
+            TaskType::Time => "time",
+            TaskType::Archivist => "archivist",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
     pub peer_id: String,
@@ -42,7 +61,7 @@ pub struct PendingQuestion {
     pub arbiter_conn_id: Option<usize>,
     pub start: Instant,
     pub phase: QuestionPhase,
-    pub is_time_task: bool,
+    pub task_type: TaskType,
 }
 
 #[derive(Debug)]
@@ -51,12 +70,13 @@ pub struct QueuedQuestion {
     pub probe_conn_id: usize,
     pub text: String,
     pub messages: Vec<crate::protocol::ChatMessage>,
-    pub is_time_task: bool,
+    pub task_type: TaskType,
     /// If Some, this queue entry is waiting for an arbiter, not generation.
     pub arbitration_for: Option<String>,
 }
 
-const MAX_QUEUE_LEN: usize = 20;
+const MAX_NORMAL_QUEUE: usize = 20;
+const MAX_LOW_QUEUE: usize = 10;
 
 #[derive(Debug)]
 pub struct HubState {
@@ -65,7 +85,8 @@ pub struct HubState {
     pub task_to_question: HashMap<String, String>,
     pub busy_peers: HashSet<usize>,
     pub probes: HashSet<usize>,
-    pub task_queue: VecDeque<QueuedQuestion>,
+    pub normal_queue: VecDeque<QueuedQuestion>,
+    pub low_queue: VecDeque<QueuedQuestion>,
     pub questions_today: u64,
     pub total_flops: f64,
 }
@@ -78,7 +99,8 @@ impl HubState {
             task_to_question: HashMap::new(),
             busy_peers: HashSet::new(),
             probes: HashSet::new(),
-            task_queue: VecDeque::new(),
+            normal_queue: VecDeque::new(),
+            low_queue: VecDeque::new(),
             questions_today: 0,
             total_flops: 0.0,
         }
@@ -105,10 +127,14 @@ impl HubState {
     }
 
     pub fn queue_len(&self) -> usize {
-        self.task_queue.len()
+        self.normal_queue.len() + self.low_queue.len()
     }
 
-    pub fn queue_full(&self) -> bool {
-        self.task_queue.len() >= MAX_QUEUE_LEN
+    pub fn normal_queue_full(&self) -> bool {
+        self.normal_queue.len() >= MAX_NORMAL_QUEUE
+    }
+
+    pub fn low_queue_full(&self) -> bool {
+        self.low_queue.len() >= MAX_LOW_QUEUE
     }
 }
