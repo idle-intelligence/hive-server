@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::Timelike;
+
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -500,7 +502,14 @@ impl Hub {
     pub fn start_stats_ticker(self: &Arc<Self>) {
         let hub = Arc::clone(self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            // Sleep until the next hh:mm:30
+            let now = chrono::Utc::now();
+            let sec = now.second() as u64;
+            let secs_until = if sec < 30 { 30 - sec } else { 90 - sec };
+            tokio::time::sleep(Duration::from_secs(secs_until)).await;
+            hub.emit_stats().await;
+
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 hub.emit_stats().await;
@@ -511,6 +520,13 @@ impl Hub {
     pub fn start_time_ticker(self: &Arc<Self>) {
         let hub = Arc::clone(self);
         tokio::spawn(async move {
+            // Sleep until the next minute boundary
+            let now = chrono::Utc::now();
+            let secs_until = 60 - now.second() as u64;
+            tokio::time::sleep(Duration::from_secs(secs_until)).await;
+            hub.handle_time_tick().await;
+
+            // Then tick every 60s, aligned to the minute
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
@@ -594,7 +610,9 @@ impl Hub {
         if state.peers.is_empty() {
             return;
         }
-        let line = hlog::swarm_stats(&state.peers, state.questions_today, state.total_flops);
+        let total_conns = self.senders.lock().await.len();
+        let spectators = total_conns.saturating_sub(state.peers.len());
+        let line = hlog::swarm_stats(&state.peers, spectators, state.questions_today, state.total_flops);
         drop(state);
         self.emit(&line).await;
     }

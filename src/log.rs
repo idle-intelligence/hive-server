@@ -70,7 +70,7 @@ pub fn swarm_status(peer_count: usize) -> String {
     format!("{} [swarm] {} peer(s) connected", ts(), peer_count)
 }
 
-pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, questions_today: u64, total_flops: f64) -> String {
+pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, spectators: usize, questions_today: u64, total_flops: f64) -> String {
     let mut heavy = 0u32;
     let mut worker = 0u32;
     let mut lite = 0u32;
@@ -97,7 +97,7 @@ pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, questions_today: u64, total
     };
 
     format!(
-        "{} [swarm] {} peers{} | {:.1} tok/s | {} questions | {:.2e} total FLOPS",
-        ts(), total, tier_str, total_tok_s, questions_today, total_flops
+        "{} [swarm] {} peers{}, {} spectators | {:.1} tok/s | {} questions | {:.2e} total FLOPS",
+        ts(), total, tier_str, spectators, total_tok_s, questions_today, total_flops
     )
 }
