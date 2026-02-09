@@ -33,6 +33,7 @@ pub struct PendingQuestion {
     pub question_id: String,
     pub questioner_conn_id: usize,
     pub text: String,
+    pub messages: Vec<crate::protocol::ChatMessage>,
     /// task_id → conn_id for generation tasks
     pub task_peers: HashMap<String, usize>,
     pub results: Vec<TaskResult>,
@@ -41,6 +42,7 @@ pub struct PendingQuestion {
     pub judge_conn_id: Option<usize>,
     pub start: Instant,
     pub phase: QuestionPhase,
+    pub is_time_task: bool,
 }
 
 #[derive(Debug)]
@@ -50,6 +52,7 @@ pub struct HubState {
     pub task_to_question: HashMap<String, String>,
     pub busy_peers: HashSet<usize>,
     pub questions_today: u64,
+    pub total_flops: f64,
 }
 
 impl HubState {
@@ -60,6 +63,7 @@ impl HubState {
             task_to_question: HashMap::new(),
             busy_peers: HashSet::new(),
             questions_today: 0,
+            total_flops: 0.0,
         }
     }
 

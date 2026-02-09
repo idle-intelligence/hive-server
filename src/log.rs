@@ -54,11 +54,23 @@ pub fn error_no_peers(q_id: &str) -> String {
     format!("{} [error] no peers available for question {}", ts(), q_id)
 }
 
+pub fn time_result(peer_id: &str, result_text: &str, tokens: u32, flops: f64) -> String {
+    let text = result_text.trim();
+    format!(
+        "{} [time] \"{}\" ({}, {} tok, {:.2e} FLOPS)",
+        ts(), text, peer_id, tokens, flops
+    )
+}
+
+pub fn time_skipped() -> String {
+    format!("{} [time] skipped — no peers available", ts())
+}
+
 pub fn swarm_status(peer_count: usize) -> String {
     format!("{} [swarm] {} peer(s) connected", ts(), peer_count)
 }
 
-pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, questions_today: u64) -> String {
+pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, questions_today: u64, total_flops: f64) -> String {
     let mut heavy = 0u32;
     let mut worker = 0u32;
     let mut lite = 0u32;
@@ -85,7 +97,7 @@ pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, questions_today: u64) -> St
     };
 
     format!(
-        "{} [swarm] {} peers{} | {:.1} tok/s | {} questions today",
-        ts(), total, tier_str, total_tok_s, questions_today
+        "{} [swarm] {} peers{} | {:.1} tok/s | {} questions | {:.2e} total FLOPS",
+        ts(), total, tier_str, total_tok_s, questions_today, total_flops
     )
 }

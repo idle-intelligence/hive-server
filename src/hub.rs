@@ -10,9 +10,12 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::log as hlog;
-use crate::protocol::{ClientMsg, HubMsg};
+use crate::protocol::{ChatMessage, ClientMsg, HubMsg};
 use crate::router;
 use crate::state::{HubState, PeerInfo, PendingQuestion, QuestionPhase, TaskResult};
+
+/// SmolLM2 1.7B ≈ 1.7B params × 2 ops/param = 3.4 GFLOPS per token
+const FLOPS_PER_TOKEN: f64 = 3.4e9;
 
 type Tx = futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>;
 
@@ -98,15 +101,24 @@ impl Hub {
                 self.state.lock().await.update_load(conn_id, load);
             }
 
-            ClientMsg::Question { text } => {
-                self.handle_question(conn_id, text).await;
+            ClientMsg::Question { text, messages } => {
+                let messages = messages.unwrap_or_else(|| {
+                    vec![ChatMessage {
+                        role: "user".to_string(),
+                        content: text.unwrap_or_default(),
+                    }]
+                });
+                let display_text = messages.last()
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+                self.handle_question(conn_id, display_text, messages).await;
             }
         }
     }
 
     // ── Question routing ────────────────────────────────────────────
 
-    async fn handle_question(self: &Arc<Self>, questioner_conn_id: usize, text: String) {
+    async fn handle_question(self: &Arc<Self>, questioner_conn_id: usize, text: String, messages: Vec<crate::protocol::ChatMessage>) {
         let q_id = format!("q_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
         let line = hlog::question_received(&q_id, &text);
@@ -146,6 +158,7 @@ impl Hub {
             question_id: q_id.clone(),
             questioner_conn_id,
             text: text.clone(),
+            messages: messages.clone(),
             task_peers,
             results: Vec::new(),
             expected_results: n,
@@ -153,6 +166,7 @@ impl Hub {
             judge_conn_id: None,
             start: Instant::now(),
             phase: QuestionPhase::Generating,
+            is_time_task: false,
         };
         state.questions.insert(q_id.clone(), pending);
         drop(state);
@@ -163,7 +177,7 @@ impl Hub {
                 task_id: task_id.clone(),
                 question_id: Some(q_id.clone()),
                 system: "Answer the following question concisely and accurately.".to_string(),
-                prompt: text.clone(),
+                messages: messages.clone(),
                 max_tokens: 256,
             };
             let line = hlog::task_assigned(task_id, &peer_info.peer_id, &peer_info.model, &peer_info.tier);
@@ -272,6 +286,20 @@ impl Hub {
 
         question.results.push(result);
 
+        // Time task: emit [time] log and accumulate FLOPS
+        if question.is_time_task {
+            let first = question.results[0].clone();
+            let flops = first.tokens as f64 * FLOPS_PER_TOKEN;
+            question.phase = QuestionPhase::Done;
+            // question borrow ends here — now safe to mutate state directly
+            state.total_flops += flops;
+            drop(state);
+
+            let line = hlog::time_result(&first.peer_id, &first.text, first.tokens, flops);
+            self.emit(&line).await;
+            return;
+        }
+
         // Degraded mode (1-2 peers): deliver first result immediately
         if question.expected_results <= 2 {
             let first = question.results[0].clone();
@@ -333,12 +361,17 @@ impl Hub {
         if let Some((judge_conn_id, judge_info)) = judges.into_iter().next() {
             let judge_task_id = format!("judge_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
-            // Build judge prompt
-            let mut prompt = format!("Question: {}\n", q_text);
+            // Build judge message content
+            let mut content = format!("Question: {}\n", q_text);
             for (i, r) in results_snapshot.iter().enumerate() {
-                prompt.push_str(&format!("\nAnswer {}: {}", i + 1, r.text));
+                content.push_str(&format!("\nAnswer {}: {}", i + 1, r.text));
             }
-            prompt.push_str("\n\nWhich answer is best? Respond with only the number.");
+            content.push_str("\n\nWhich answer is best? Respond with only the number.");
+
+            let judge_messages = vec![crate::protocol::ChatMessage {
+                role: "user".to_string(),
+                content,
+            }];
 
             // Now take mutable borrow to update phase
             let question = state.questions.get_mut(question_id).unwrap();
@@ -359,7 +392,7 @@ impl Hub {
                 task_id: judge_task_id,
                 question_id: Some(question_id.to_string()),
                 system: "You are a judge. You will receive a question and several candidate answers. Pick the best one. Respond with ONLY the number (1, 2, or 3) of the best answer.".to_string(),
-                prompt,
+                messages: judge_messages,
                 max_tokens: 8,
             };
             self.send_to(judge_conn_id, &task).await;
@@ -475,12 +508,93 @@ impl Hub {
         });
     }
 
+    pub fn start_time_ticker(self: &Arc<Self>) {
+        let hub = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                hub.handle_time_tick().await;
+            }
+        });
+    }
+
+    async fn handle_time_tick(self: &Arc<Self>) {
+        let now = chrono::Utc::now();
+        let tag = now.timestamp();
+        let task_id = format!("time_{}", tag);
+        let q_id = format!("time_{}", tag);
+
+        let system = "You will be told the current time. Rewrite it naturally in your own words, \
+            then add a brief observation. Write it as a single flowing sentence. \
+            Do not use JSON. Do not repeat the exact format you were given."
+            .to_string();
+        let readable = now.format("%A, %B %-d, %Y, %H:%M UTC").to_string();
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: format!("Current time: {readable}"),
+        }];
+
+        let mut state = self.state.lock().await;
+
+        let selected = router::select_peers(&state.peers, &state.busy_peers, 1);
+        if selected.is_empty() {
+            drop(state);
+            let line = hlog::time_skipped();
+            self.emit(&line).await;
+            return;
+        }
+
+        let (peer_conn_id, peer_info) = selected.into_iter().next().unwrap();
+
+        let mut task_peers = HashMap::new();
+        task_peers.insert(task_id.clone(), peer_conn_id);
+        state.task_to_question.insert(task_id.clone(), q_id.clone());
+        state.busy_peers.insert(peer_conn_id);
+
+        let pending = PendingQuestion {
+            question_id: q_id.clone(),
+            questioner_conn_id: 0,
+            text: String::new(),
+            messages: messages.clone(),
+            task_peers,
+            results: Vec::new(),
+            expected_results: 1,
+            judge_task_id: None,
+            judge_conn_id: None,
+            start: Instant::now(),
+            phase: QuestionPhase::Generating,
+            is_time_task: true,
+        };
+        state.questions.insert(q_id.clone(), pending);
+        drop(state);
+
+        let line = hlog::task_assigned(&task_id, &peer_info.peer_id, &peer_info.model, &peer_info.tier);
+        self.emit(&line).await;
+
+        let task = HubMsg::Task {
+            task_id,
+            question_id: None,
+            system,
+            messages,
+            max_tokens: 128,
+        };
+        self.send_to(peer_conn_id, &task).await;
+
+        // 30s timeout
+        let hub = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            hub.handle_timeout(&q_id).await;
+        });
+    }
+
     async fn emit_stats(&self) {
         let state = self.state.lock().await;
         if state.peers.is_empty() {
             return;
         }
-        let line = hlog::swarm_stats(&state.peers, state.questions_today);
+        let line = hlog::swarm_stats(&state.peers, state.questions_today, state.total_flops);
         drop(state);
         self.emit(&line).await;
     }
