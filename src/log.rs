@@ -90,14 +90,21 @@ pub fn swarm_status(peer_count: usize) -> String {
 pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: usize, questions_today: u64, total_flops: f64) -> (String, Option<String>) {
     let total = peers.len();
     let mut total_tok_s = 0.0;
+    let mut size_counts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
 
     for peer in peers.values() {
         total_tok_s += peer.tok_s;
+        *size_counts.entry(&peer.model_size).or_insert(0) += 1;
     }
 
+    let sizes = size_counts.iter()
+        .map(|(size, count)| format!("{count} {size}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let peer_line = format!(
-        "{} [swarm] {} Peer | {:.1} tok/s | {} Question | {:.2e} total FLOPS",
-        ts(), total, total_tok_s, questions_today, total_flops
+        "{} [swarm] {} Peer: {} | {:.1} tok/s | {} Question | {:.2e} total FLOPS",
+        ts(), total, sizes, total_tok_s, questions_today, total_flops
     );
 
     let clients = probes + observers;
