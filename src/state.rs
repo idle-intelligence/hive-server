@@ -7,6 +7,7 @@ pub enum TaskType {
     Arbiter,
     Time,
     Archivist,
+    Benchmark,
 }
 
 impl TaskType {
@@ -16,6 +17,7 @@ impl TaskType {
             TaskType::Arbiter => "arbiter",
             TaskType::Time => "time",
             TaskType::Archivist => "archivist",
+            TaskType::Benchmark => "benchmark",
         }
     }
 }

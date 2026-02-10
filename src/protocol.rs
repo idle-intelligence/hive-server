@@ -14,7 +14,8 @@ pub enum ClientMsg {
         peer_id: String,
         model: String,
         model_size: String,
-        tok_s: f64,
+        #[serde(default)]
+        tok_s: Option<f64>,
     },
     Result {
         task_id: String,

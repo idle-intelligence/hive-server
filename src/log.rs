@@ -8,8 +8,12 @@ pub fn ts() -> String {
     Utc::now().format("%H:%M:%S").to_string()
 }
 
-pub fn peer_joined(peer_id: &str, model: &str, model_size: &str, tok_s: f64) -> String {
-    format!("{} [peer] {} joined ({}, {}, {:.1} tok/s)", ts(), peer_id, model, model_size, tok_s)
+pub fn peer_joined_benchmarking(peer_id: &str, model: &str, model_size: &str) -> String {
+    format!("{} [peer] {} joined ({}, {}, benchmarking...)", ts(), peer_id, model, model_size)
+}
+
+pub fn peer_ready(peer_id: &str, tok_s: f64) -> String {
+    format!("{} [peer] {} ready ({:.1} tok/s)", ts(), peer_id, tok_s)
 }
 
 pub fn peer_left(peer_id: &str, reason: &str) -> String {

@@ -147,23 +147,61 @@ impl Hub {
     async fn handle_message(self: &Arc<Self>, conn_id: usize, msg: ClientMsg) {
         match msg {
             ClientMsg::Register { peer_id, model, model_size, tok_s } => {
-                let line = hlog::peer_joined(&peer_id, &model, &model_size, tok_s);
+                let line = hlog::peer_joined_benchmarking(&peer_id, &model, &model_size);
                 self.emit(&line).await;
 
                 let info = PeerInfo {
-                    peer_id,
+                    peer_id: peer_id.clone(),
                     model,
                     model_size,
-                    tok_s,
+                    tok_s: tok_s.unwrap_or(0.0),
                     load: 0.0,
                 };
-                self.state.lock().await.add_peer(conn_id, info);
+
+                let bench_task_id = format!("bench_{}", peer_id);
+                let bench_q_id = format!("benchq_{}", peer_id);
+                let stats_str;
+                {
+                    let mut state = self.state.lock().await;
+                    state.add_peer(conn_id, info);
+                    state.busy_peers.insert(conn_id);
+                    stats_str = serialize_swarm_stats(&state);
+                    state.task_to_question.insert(bench_task_id.clone(), bench_q_id.clone());
+                    state.questions.insert(bench_q_id.clone(), PendingQuestion {
+                        question_id: bench_q_id.clone(),
+                        probe_conn_id: 0,
+                        text: String::new(),
+                        messages: Vec::new(),
+                        task_id: bench_task_id.clone(),
+                        gen_peers: vec![conn_id],
+                        results: Vec::new(),
+                        expected_results: 1,
+                        arbiter_task_id: None,
+                        arbiter_conn_id: None,
+                        start: Instant::now(),
+                        phase: QuestionPhase::Generating,
+                        task_type: TaskType::Benchmark,
+                        route_tag: None,
+                    });
+                }
 
                 let count = self.state.lock().await.peer_count();
                 let status = hlog::swarm_status(count);
                 self.emit(&status).await;
 
-                self.try_dispatch_queue().await;
+                let system = format!("{SWARM_SYSTEM_PROMPT}\n\nCurrent swarm state:\n{stats_str}");
+                let task = HubMsg::Task {
+                    task_id: bench_task_id,
+                    question_id: None,
+                    task_type: "benchmark".to_string(),
+                    system,
+                    messages: vec![ChatMessage {
+                        role: "user".to_string(),
+                        content: "How many peers are there in the swarm?".to_string(),
+                    }],
+                    max_tokens: 128,
+                };
+                self.send_to(conn_id, &task).await;
             }
 
             ClientMsg::Result { task_id, text, tok_s, tokens, inference_ms } => {
@@ -191,6 +229,56 @@ impl Hub {
                 self.handle_question(conn_id, display_text, messages, route_tag, tagger_tokens, tagger_ms).await;
             }
         }
+    }
+
+    // ── Message truncation ──────────────────────────────────────────
+
+    /// Truncate messages array to fit within context window.
+    /// Always keeps the last user message. Drops oldest turns first.
+    /// Estimates tokens as chars / 4.
+    fn truncate_messages(
+        messages: &[ChatMessage],
+        system: &str,
+        max_tokens: u32,
+    ) -> Vec<ChatMessage> {
+        const CONTEXT_WINDOW: usize = 2048; // SmolLM2-1.7B context window
+        const SAFETY_MARGIN: usize = 50;
+
+        let estimate_tokens = |text: &str| text.chars().count() / 4;
+
+        let system_tokens = estimate_tokens(system);
+        let budget = CONTEXT_WINDOW
+            .saturating_sub(system_tokens)
+            .saturating_sub(max_tokens as usize)
+            .saturating_sub(SAFETY_MARGIN);
+
+        if messages.is_empty() {
+            return Vec::new();
+        }
+
+        // Always keep the last message
+        let last_msg = &messages[messages.len() - 1];
+        let last_tokens = estimate_tokens(&last_msg.content);
+
+        if last_tokens >= budget {
+            // Even the last message doesn't fit — return it anyway (will be truncated by model)
+            return vec![last_msg.clone()];
+        }
+
+        let mut total_tokens = last_tokens;
+        let mut keep_from = messages.len() - 1;
+
+        // Walk backwards, adding messages until we exceed budget
+        for i in (0..messages.len() - 1).rev() {
+            let msg_tokens = estimate_tokens(&messages[i].content);
+            if total_tokens + msg_tokens > budget {
+                break;
+            }
+            total_tokens += msg_tokens;
+            keep_from = i;
+        }
+
+        messages[keep_from..].to_vec()
     }
 
     // ── Question routing ────────────────────────────────────────────
@@ -252,7 +340,7 @@ impl Hub {
         let n_peers = match task_type {
             TaskType::Answer => 3,
             TaskType::Time | TaskType::Archivist => 1,
-            TaskType::Arbiter => unreachable!(),
+            TaskType::Arbiter | TaskType::Benchmark => unreachable!(),
         };
         let selected = router::select_peers(&state.peers, &exclude, n_peers);
 
@@ -269,7 +357,7 @@ impl Hub {
             TaskType::Answer => if route_tag == Some("swarm") { 256 } else { 128 },
             TaskType::Time => 64,
             TaskType::Archivist => 60,
-            TaskType::Arbiter => unreachable!(),
+            TaskType::Arbiter | TaskType::Benchmark => unreachable!(),
         };
 
         let mut gen_peers = Vec::new();
@@ -333,20 +421,22 @@ impl Hub {
                 }
                 TaskType::Time => "You are a drone in a distributed swarm of language models. You will be told the current time. Rewrite it naturally in your own words, then add a brief observation. Write it as a single flowing sentence. Do not use JSON. Do not repeat the exact format you were given.".to_string(),
                 TaskType::Archivist => "Classify this question. Reply with exactly one line: category, tag, tag, summary (5 words).\n\nCategories: tech, science, history, literature, music, art, finance, philosophy, language, life, swarm, other\n\nExamples:\nliterature, shakespeare, hamlet, Hamlet character friend of Guildenstern\ntech, rust, wasm, Compile Rust to WASM tutorial\nlife, cooking, pasta, Boil spaghetti eight to ten\nswarm, peers, status, Twelve peers connected right now\nother, nonsense, gibberish, Gibberish question polite refusal given".to_string(),
-                TaskType::Arbiter => unreachable!(),
+                TaskType::Arbiter | TaskType::Benchmark => unreachable!(),
             };
+            // Truncate messages to fit peer's context window
+            let truncated_messages = Self::truncate_messages(messages, &system, max_tokens);
             let task = HubMsg::Task {
                 task_id: task_id.clone(),
                 question_id: question_id_for_msg.clone(),
                 task_type: task_type.as_str().to_string(),
                 system,
-                messages: messages.to_vec(),
+                messages: truncated_messages,
                 max_tokens,
             };
             self.send_to(*conn_id, &task).await;
         }
 
-        // Spawn 30s timeout
+        // Spawn 12s timeout
         let hub = Arc::clone(self);
         let q_id_owned = q_id.to_string();
         tokio::spawn(async move {
@@ -398,6 +488,7 @@ impl Hub {
                     match queued.task_type {
                         TaskType::Answer | TaskType::Arbiter => state.normal_queue.push_front(queued),
                         TaskType::Time | TaskType::Archivist => state.low_queue.push_front(queued),
+                        TaskType::Benchmark => unreachable!(),
                     }
                     break;
                 }
@@ -429,16 +520,38 @@ impl Hub {
         tokens: u32,
         inference_ms: u64,
     ) {
-        // 1. Get peer info, unmark busy, look up question
-        let (peer_id, question_id) = {
+        // 1. Get peer info, unmark busy, look up question. Handle benchmarks inline.
+        let (peer_id, question_id, is_benchmark) = {
             let mut state = self.state.lock().await;
             let peer_id = state.peers.get(&conn_id)
                 .map(|p| p.peer_id.clone())
                 .unwrap_or_else(|| format!("conn_{conn_id}"));
             let question_id = state.task_to_question.get(&task_id).cloned();
             state.busy_peers.remove(&conn_id);
-            (peer_id, question_id)
+
+            let is_benchmark = question_id.as_ref()
+                .and_then(|qid| state.questions.get(qid))
+                .map(|q| q.task_type == TaskType::Benchmark)
+                .unwrap_or(false);
+
+            if is_benchmark {
+                if let Some(peer) = state.peers.get_mut(&conn_id) {
+                    peer.tok_s = tok_s;
+                }
+                if let Some(ref qid) = question_id {
+                    state.questions.remove(qid);
+                    state.task_to_question.remove(&task_id);
+                }
+            }
+
+            (peer_id, question_id, is_benchmark)
         };
+
+        if is_benchmark {
+            let line = hlog::peer_ready(&peer_id, tok_s);
+            self.emit(&line).await;
+            return;
+        }
 
         // 2. Always log task completion
         let line = hlog::task_completed(&task_id, &peer_id, tokens, inference_ms, tok_s);
@@ -635,10 +748,15 @@ impl Hub {
             }
             content.push_str("\n\nWhich answer is best? Respond with only the number.");
 
+            let arbiter_system = "You are an arbiter in a distributed swarm of language models. You will receive a question and several candidate answers from other nodes. Pick the best one.\n\nRespond with ONLY the number of the best answer. Nothing else.".to_string();
+
             let arbiter_messages = vec![crate::protocol::ChatMessage {
                 role: "user".to_string(),
                 content,
             }];
+
+            // Truncate arbiter messages to fit context window
+            let truncated_arbiter_messages = Self::truncate_messages(&arbiter_messages, &arbiter_system, 8);
 
             // Now take mutable borrow to update phase
             let question = state.questions.get_mut(question_id).unwrap();
@@ -659,8 +777,8 @@ impl Hub {
                 task_id: arbiter_task_id,
                 question_id: Some(question_id.to_string()),
                 task_type: "arbiter".to_string(),
-                system: "You are an arbiter in a distributed swarm of language models. You will receive a question and several candidate answers from other nodes. Pick the best one.\n\nRespond with ONLY the number of the best answer. Nothing else.".to_string(),
-                messages: arbiter_messages,
+                system: arbiter_system,
+                messages: truncated_arbiter_messages,
                 max_tokens: 8,
             };
             self.send_to(arbiter_conn_id, &task).await;
