@@ -60,16 +60,10 @@ fn json_to_compact_yaml(value: &serde_json::Value) -> String {
 }
 
 fn serialize_swarm_stats(state: &HubState) -> String {
-    let mut n_overlord = 0u32;
-    let mut n_drone = 0u32;
     let mut n_busy = 0u32;
     let mut total_tok_s = 0.0f64;
 
     for (conn_id, peer) in &state.peers {
-        match peer.tier.as_str() {
-            "overlord" => n_overlord += 1,
-            _ => n_drone += 1,
-        }
         if state.busy_peers.contains(conn_id) {
             n_busy += 1;
         }
@@ -81,8 +75,6 @@ fn serialize_swarm_stats(state: &HubState) -> String {
     json_to_compact_yaml(&serde_json::json!({
         "peers": {
             "total": total,
-            "overlord": n_overlord,
-            "drone": n_drone,
             "busy": n_busy
         },
         "performance": {
@@ -154,14 +146,14 @@ impl Hub {
 
     async fn handle_message(self: &Arc<Self>, conn_id: usize, msg: ClientMsg) {
         match msg {
-            ClientMsg::Register { peer_id, tier, model, tok_s } => {
-                let line = hlog::peer_joined(&peer_id, &model, &tier, tok_s);
+            ClientMsg::Register { peer_id, model, model_size, tok_s } => {
+                let line = hlog::peer_joined(&peer_id, &model, &model_size, tok_s);
                 self.emit(&line).await;
 
                 let info = PeerInfo {
                     peer_id,
-                    tier,
                     model,
+                    model_size,
                     tok_s,
                     load: 0.0,
                 };
@@ -257,12 +249,12 @@ impl Hub {
 
         let mut exclude = state.busy_peers.clone();
         exclude.insert(probe_conn_id);
-        let (n_peers, prefer_tier) = match task_type {
-            TaskType::Answer => (3, Some("drone")),
-            TaskType::Time | TaskType::Archivist => (1, None),
+        let n_peers = match task_type {
+            TaskType::Answer => 3,
+            TaskType::Time | TaskType::Archivist => 1,
             TaskType::Arbiter => unreachable!(),
         };
-        let selected = router::select_peers(&state.peers, &exclude, n_peers, prefer_tier);
+        let selected = router::select_peers(&state.peers, &exclude, n_peers);
 
         if selected.is_empty() {
             return false;
@@ -319,8 +311,10 @@ impl Hub {
         drop(state);
 
         // One log line listing all assigned peers
-        let peer_ids: Vec<String> = peers_to_send.iter().map(|(_, p)| p.peer_id.clone()).collect();
-        let line = hlog::task_assigned(&task_id, &peer_ids);
+        let peer_labels: Vec<(String, String)> = peers_to_send.iter()
+            .map(|(_, p)| (p.peer_id.clone(), p.model_size.clone()))
+            .collect();
+        let line = hlog::task_assigned(&task_id, &peer_labels);
         self.emit(&line).await;
 
         let question_id_for_msg = match task_type {
@@ -328,22 +322,16 @@ impl Hub {
             _ => None,
         };
 
-        for (conn_id, peer_info) in &peers_to_send {
+        for (conn_id, _peer_info) in &peers_to_send {
             let system = match task_type {
                 TaskType::Answer => {
                     if let Some(ref stats) = swarm_stats_str {
                         format!("{SWARM_SYSTEM_PROMPT}\n\nCurrent swarm state:\n{stats}")
                     } else {
-                        format!(
-                            "You are a {} \u{2014} one node in a distributed swarm of small language models running in browser tabs around the world. You are answering a question alongside other peers \u{2014} an arbiter will pick the best answer.\n\nBe concise. One to three sentences unless the question genuinely requires more. Do not make up URLs, commands, or specific numbers you aren\u{2019}t sure about. If you don\u{2019}t know, say so briefly.",
-                            tier_label(&peer_info.tier)
-                        )
+                        "You are a drone \u{2014} one node in a distributed swarm of small language models running in browser tabs around the world. You are answering a question alongside other peers \u{2014} an arbiter will pick the best answer.\n\nBe concise. One to three sentences unless the question genuinely requires more. Do not make up URLs, commands, or specific numbers you aren\u{2019}t sure about. If you don\u{2019}t know, say so briefly.".to_string()
                     }
                 }
-                TaskType::Time => format!(
-                    "You are a {} in a distributed swarm of language models. You will be told the current time. Rewrite it naturally in your own words, then add a brief observation. Write it as a single flowing sentence. Do not use JSON. Do not repeat the exact format you were given.",
-                    tier_label(&peer_info.tier)
-                ),
+                TaskType::Time => "You are a drone in a distributed swarm of language models. You will be told the current time. Rewrite it naturally in your own words, then add a brief observation. Write it as a single flowing sentence. Do not use JSON. Do not repeat the exact format you were given.".to_string(),
                 TaskType::Archivist => "Classify this question. Reply with exactly one line: category, tag, tag, summary (5 words).\n\nCategories: tech, science, history, literature, music, art, finance, philosophy, language, life, swarm, other\n\nExamples:\nliterature, shakespeare, hamlet, Hamlet character friend of Guildenstern\ntech, rust, wasm, Compile Rust to WASM tutorial\nlife, cooking, pasta, Boil spaghetti eight to ten\nswarm, peers, status, Twelve peers connected right now\nother, nonsense, gibberish, Gibberish question polite refusal given".to_string(),
                 TaskType::Arbiter => unreachable!(),
             };
@@ -635,7 +623,7 @@ impl Hub {
         }
         exclude.insert(probe);
 
-        let arbiters = router::select_peers(&state.peers, &exclude, 1, Some("overlord"));
+        let arbiters = router::select_peers(&state.peers, &exclude, 1);
 
         if let Some((arbiter_conn_id, arbiter_info)) = arbiters.into_iter().next() {
             let arbiter_task_id = question_id.replacen("q_", "arb_", 1);
@@ -663,7 +651,7 @@ impl Hub {
             drop(state);
 
             let line = hlog::arbiter_assigned(
-                &arbiter_task_id, &arbiter_info.peer_id, &arbiter_info.model, &arbiter_info.tier,
+                &arbiter_task_id, &arbiter_info.peer_id, &arbiter_info.model, &arbiter_info.model_size,
             );
             self.emit(&line).await;
 
@@ -942,14 +930,6 @@ impl Hub {
                 senders.remove(&conn_id);
             }
         }
-    }
-}
-
-fn tier_label(tier: &str) -> &'static str {
-    match tier {
-        "overlord" => "overlord",
-        "drone" => "drone",
-        _ => "probe",
     }
 }
 

@@ -12,8 +12,8 @@ pub struct ChatMessage {
 pub enum ClientMsg {
     Register {
         peer_id: String,
-        tier: String,
         model: String,
+        model_size: String,
         tok_s: f64,
     },
     Result {

@@ -8,20 +8,19 @@ pub fn ts() -> String {
     Utc::now().format("%H:%M:%S").to_string()
 }
 
-pub fn peer_joined(peer_id: &str, model: &str, tier: &str, tok_s: f64) -> String {
-    if tier == "overlord" {
-        format!("{} [peer] {} joined ({}, {}, {:.1} tok/s) — Overlord has arrived.", ts(), peer_id, model, tier, tok_s)
-    } else {
-        format!("{} [peer] {} joined ({}, {}, {:.1} tok/s)", ts(), peer_id, model, tier, tok_s)
-    }
+pub fn peer_joined(peer_id: &str, model: &str, model_size: &str, tok_s: f64) -> String {
+    format!("{} [peer] {} joined ({}, {}, {:.1} tok/s)", ts(), peer_id, model, model_size, tok_s)
 }
 
 pub fn peer_left(peer_id: &str, reason: &str) -> String {
     format!("{} [peer] {} left ({})", ts(), peer_id, reason)
 }
 
-pub fn task_assigned(task_id: &str, peer_ids: &[String]) -> String {
-    let list = peer_ids.join(", ");
+pub fn task_assigned(task_id: &str, peers: &[(String, String)]) -> String {
+    let list = peers.iter()
+        .map(|(id, size)| format!("{} ({})", id, size))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("{} [task {}] assigned to [{}]", ts(), task_id, list)
 }
 
@@ -42,8 +41,8 @@ pub fn question_received(q_id: &str, text: &str, route: Option<&str>, tagger_tok
     }
 }
 
-pub fn arbiter_assigned(arbiter_id: &str, peer_id: &str, model: &str, tier: &str) -> String {
-    format!("{} [arbiter {}] assigned to {} ({}, {})", ts(), arbiter_id, peer_id, model, tier)
+pub fn arbiter_assigned(arbiter_id: &str, peer_id: &str, model: &str, model_size: &str) -> String {
+    format!("{} [arbiter {}] assigned to {} ({}, {})", ts(), arbiter_id, peer_id, model, model_size)
 }
 
 pub fn arbiter_completed(arbiter_id: &str, picked_peer: &str, candidates: usize, secs: f64) -> String {
@@ -89,34 +88,16 @@ pub fn swarm_status(peer_count: usize) -> String {
 }
 
 pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: usize, questions_today: u64, total_flops: f64) -> (String, Option<String>) {
-    let mut n_overlord = 0u32;
-    let mut n_drone = 0u32;
-    let mut n_probe_tier = 0u32;
+    let total = peers.len();
     let mut total_tok_s = 0.0;
 
     for peer in peers.values() {
-        match peer.tier.as_str() {
-            "overlord" => n_overlord += 1,
-            "drone" => n_drone += 1,
-            _ => n_probe_tier += 1,
-        }
         total_tok_s += peer.tok_s;
     }
 
-    let total = peers.len();
-    let mut tiers = Vec::new();
-    if n_overlord > 0 { tiers.push(format!("{n_overlord} Overlord")); }
-    if n_drone > 0 { tiers.push(format!("{n_drone} Drone")); }
-    if n_probe_tier > 0 { tiers.push(format!("{n_probe_tier} Probe")); }
-    let tier_str = if tiers.is_empty() {
-        String::new()
-    } else {
-        format!(" : {}", tiers.join(", "))
-    };
-
     let peer_line = format!(
-        "{} [swarm] {} Peer{} | {:.1} tok/s | {} Question | {:.2e} total FLOPS",
-        ts(), total, tier_str, total_tok_s, questions_today, total_flops
+        "{} [swarm] {} Peer | {:.1} tok/s | {} Question | {:.2e} total FLOPS",
+        ts(), total, total_tok_s, questions_today, total_flops
     );
 
     let clients = probes + observers;

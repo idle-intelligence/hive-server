@@ -23,8 +23,8 @@ impl TaskType {
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
     pub peer_id: String,
-    pub tier: String,
     pub model: String,
+    pub model_size: String,
     pub tok_s: f64,
     pub load: f64,
 }
