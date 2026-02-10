@@ -195,7 +195,7 @@ impl Hub {
         let max_tokens: u32 = match task_type {
             TaskType::Answer => 128,
             TaskType::Time => 64,
-            TaskType::Archivist => 80,
+            TaskType::Archivist => 60,
             TaskType::Arbiter => unreachable!(),
         };
 
@@ -248,7 +248,7 @@ impl Hub {
                     "You are a {} in a distributed swarm of language models. You will be told the current time. Rewrite it naturally in your own words, then add a brief observation. Write it as a single flowing sentence. Do not use JSON. Do not repeat the exact format you were given.",
                     tier_label(&peer_info.tier)
                 ),
-                TaskType::Archivist => "You categorize and summarize question-answer pairs for a distributed AI swarm.\n\nCategories (pick exactly one):\ntech, science, history, literature, music, art, finance, philosophy, language, life, swarm\n\nRespond with ONLY this JSON, nothing else:\n{\"category\": \"...\", \"tags\": [\"...\", \"...\"], \"summary\": \"...\"}\n\nRules:\n- category: exactly one from the list above\n- tags: 1-2 lowercase tags, hyphenated if multi-word\n- summary: one sentence describing what was asked and answered".to_string(),
+                TaskType::Archivist => "Reply with ONLY one line of JSON. No other text.\n\nRules:\n- category: one of tech, science, history, literature, music, art, finance, philosophy, language, life, swarm, other\n- tags: exactly 2 single-word lowercase tags\n- summary: exactly 5 words\n\n{\"category\":\"literature\",\"tags\":[\"shakespeare\",\"hamlet\"],\"summary\":\"Hamlet character, friend of Guildenstern\"}\n{\"category\":\"tech\",\"tags\":[\"rust\",\"wasm\"],\"summary\":\"Compile Rust to WASM tutorial\"}\n{\"category\":\"life\",\"tags\":[\"cooking\",\"pasta\"],\"summary\":\"Boil spaghetti eight to ten\"}\n{\"category\":\"swarm\",\"tags\":[\"peers\",\"status\"],\"summary\":\"Twelve peers connected right now\"}\n{\"category\":\"other\",\"tags\":[\"nonsense\",\"gibberish\"],\"summary\":\"Gibberish question, polite refusal given\"}".to_string(),
                 TaskType::Arbiter => unreachable!(),
             };
             let task = HubMsg::Task {
@@ -442,14 +442,18 @@ impl Hub {
             return;
         }
 
-        // Archivist task: log result and done
+        // Archivist task: log raw result and done
         if question.task_type == TaskType::Archivist {
             let first = question.results[0].clone();
+            let q_id = question.question_id.clone();
             question.phase = QuestionPhase::Done;
             drop(state);
 
-            let secs = first.inference_ms as f64 / 1000.0;
-            let line = hlog::archivist_result(&first.task_id, &first.peer_id, &first.text, first.tokens, secs);
+            let line = if first.text.trim().is_empty() {
+                hlog::archivist_failed(&q_id, "empty")
+            } else {
+                hlog::archivist_result(&q_id, &first.text)
+            };
             self.emit(&line).await;
             return;
         }
@@ -533,7 +537,7 @@ impl Hub {
         }
         exclude.insert(probe);
 
-        let arbiters = router::select_peers(&state.peers, &exclude, 1, Some("carrier"));
+        let arbiters = router::select_peers(&state.peers, &exclude, 1, Some("overlord"));
 
         if let Some((arbiter_conn_id, arbiter_info)) = arbiters.into_iter().next() {
             let arbiter_task_id = format!("arb_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -589,9 +593,16 @@ impl Hub {
             _ => return,
         };
 
-        // Non-answer tasks (time, archivist) just get silently dropped on timeout
+        // Non-answer tasks: time silently drops, archivist logs failure
         if question.task_type != TaskType::Answer {
+            let is_archivist = question.task_type == TaskType::Archivist;
+            let q_id = question.question_id.clone();
             question.phase = QuestionPhase::Done;
+            drop(state);
+            if is_archivist {
+                let line = hlog::archivist_failed(&q_id, "timeout");
+                self.emit(&line).await;
+            }
             return;
         }
 
@@ -833,7 +844,7 @@ impl Hub {
 
 fn tier_label(tier: &str) -> &'static str {
     match tier {
-        "carrier" => "carrier",
+        "overlord" => "overlord",
         "drone" => "drone",
         _ => "probe",
     }

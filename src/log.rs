@@ -9,8 +9,8 @@ pub fn ts() -> String {
 }
 
 pub fn peer_joined(peer_id: &str, model: &str, tier: &str, tok_s: f64) -> String {
-    if tier == "carrier" {
-        format!("{} [peer] {} joined ({}, {}, {:.1} tok/s) — Carrier has arrived.", ts(), peer_id, model, tier, tok_s)
+    if tier == "overlord" {
+        format!("{} [peer] {} joined ({}, {}, {:.1} tok/s) — Overlord has arrived.", ts(), peer_id, model, tier, tok_s)
     } else {
         format!("{} [peer] {} joined ({}, {}, {:.1} tok/s)", ts(), peer_id, model, tier, tok_s)
     }
@@ -71,12 +71,12 @@ pub fn queue_full(q_id: &str) -> String {
     format!("{} [queue] {} rejected — queue full", ts(), q_id)
 }
 
-pub fn archivist_result(task_id: &str, peer_id: &str, text: &str, tokens: u32, secs: f64) -> String {
-    let text = text.trim();
-    format!(
-        "{} [archivist {}] {} — \"{}\" ({} tok, {:.1}s)",
-        ts(), task_id, peer_id, text, tokens, secs
-    )
+pub fn archivist_result(task_id: &str, text: &str) -> String {
+    format!("{} [archivist {}] {}", ts(), task_id, text.trim())
+}
+
+pub fn archivist_failed(task_id: &str, reason: &str) -> String {
+    format!("{} [archivist {}] failed ({})", ts(), task_id, reason)
 }
 
 pub fn swarm_status(peer_count: usize) -> String {
@@ -84,14 +84,14 @@ pub fn swarm_status(peer_count: usize) -> String {
 }
 
 pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: usize, questions_today: u64, total_flops: f64) -> String {
-    let mut n_carrier = 0u32;
+    let mut n_overlord = 0u32;
     let mut n_drone = 0u32;
     let mut n_probe_tier = 0u32;
     let mut total_tok_s = 0.0;
 
     for peer in peers.values() {
         match peer.tier.as_str() {
-            "carrier" => n_carrier += 1,
+            "overlord" => n_overlord += 1,
             "drone" => n_drone += 1,
             _ => n_probe_tier += 1,
         }
@@ -100,7 +100,7 @@ pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: u
 
     let total = peers.len();
     let mut tiers = Vec::new();
-    if n_carrier > 0 { tiers.push(format!("{n_carrier} Carrier")); }
+    if n_overlord > 0 { tiers.push(format!("{n_overlord} Overlord")); }
     if n_drone > 0 { tiers.push(format!("{n_drone} Drone")); }
     if n_probe_tier > 0 { tiers.push(format!("{n_probe_tier} Probe")); }
     let tier_str = if tiers.is_empty() {
