@@ -83,7 +83,7 @@ pub fn swarm_status(peer_count: usize) -> String {
     format!("{} [swarm] {} Peer connected", ts(), peer_count)
 }
 
-pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: usize, questions_today: u64, total_flops: f64) -> String {
+pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: usize, questions_today: u64, total_flops: f64) -> (String, Option<String>) {
     let mut n_overlord = 0u32;
     let mut n_drone = 0u32;
     let mut n_probe_tier = 0u32;
@@ -106,11 +106,23 @@ pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: u
     let tier_str = if tiers.is_empty() {
         String::new()
     } else {
-        format!(" ({})", tiers.join(", "))
+        format!(" : {}", tiers.join(", "))
     };
 
-    format!(
-        "{} [swarm] {} Peer{}, {} Probe, {} Observer | {:.1} tok/s | {} Question | {:.2e} total FLOPS",
-        ts(), total, tier_str, probes, observers, total_tok_s, questions_today, total_flops
-    )
+    let peer_line = format!(
+        "{} [swarm] {} Peer{} | {:.1} tok/s | {} Question | {:.2e} total FLOPS",
+        ts(), total, tier_str, total_tok_s, questions_today, total_flops
+    );
+
+    let clients = probes + observers;
+    let client_line = if clients > 0 {
+        let mut parts = Vec::new();
+        if probes > 0 { parts.push(format!("{probes} Probe")); }
+        if observers > 0 { parts.push(format!("{observers} Observer")); }
+        Some(format!("{} [swarm] {} Client : {}", ts(), clients, parts.join(", ")))
+    } else {
+        None
+    };
+
+    (peer_line, client_line)
 }

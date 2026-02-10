@@ -187,11 +187,10 @@ impl Hub {
         }
 
         let n = selected.len();
-        let task_id_prefix = match task_type {
-            TaskType::Archivist => "arch",
-            _ => "task",
+        let task_id = match task_type {
+            TaskType::Answer => q_id.replacen("q_", "task_", 1),
+            _ => q_id.to_string(), // time/archivist: task_id = q_id
         };
-        let task_id = format!("{}_{}", task_id_prefix, &uuid::Uuid::new_v4().to_string()[..8]);
         let max_tokens: u32 = match task_type {
             TaskType::Answer => 128,
             TaskType::Time => 64,
@@ -540,7 +539,7 @@ impl Hub {
         let arbiters = router::select_peers(&state.peers, &exclude, 1, Some("overlord"));
 
         if let Some((arbiter_conn_id, arbiter_info)) = arbiters.into_iter().next() {
-            let arbiter_task_id = format!("arb_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+            let arbiter_task_id = question_id.replacen("q_", "arb_", 1);
 
             // Build arbiter message content
             let mut content = format!("Question: {}\n", q_text);
@@ -779,15 +778,18 @@ impl Hub {
         let non_peers = total_conns.saturating_sub(state.peers.len());
         let probes = state.probes.len();
         let observers = non_peers.saturating_sub(probes);
-        let line = hlog::swarm_stats(&state.peers, probes, observers, state.questions_today, state.total_flops);
+        let (peer_line, client_line) = hlog::swarm_stats(&state.peers, probes, observers, state.questions_today, state.total_flops);
         drop(state);
-        self.emit(&line).await;
+        self.emit(&peer_line).await;
+        if let Some(line) = client_line {
+            self.emit(&line).await;
+        }
     }
 
     // ── Archivist ─────────────────────────────────────────────────────
 
-    async fn queue_archivist(self: &Arc<Self>, _question_id: &str, question_text: &str, answer_text: &str) {
-        let arch_id = format!("arch_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    async fn queue_archivist(self: &Arc<Self>, question_id: &str, question_text: &str, answer_text: &str) {
+        let arch_id = question_id.replacen("q_", "arch_", 1);
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: format!("Question: {}\nAnswer: {}", question_text, answer_text),
