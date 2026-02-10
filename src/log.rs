@@ -33,8 +33,13 @@ pub fn task_completed(task_id: &str, peer_id: &str, tokens: u32, inference_ms: u
     )
 }
 
-pub fn question_received(q_id: &str, text: &str) -> String {
-    format!("{} [question {}] received: \"{}\"", ts(), q_id, text)
+pub fn question_received(q_id: &str, text: &str, route: Option<&str>, tagger_tokens: Option<u32>, tagger_ms: Option<u64>) -> String {
+    let base = format!("{} [question {}] received: \"{}\"", ts(), q_id, text);
+    match (route, tagger_tokens, tagger_ms) {
+        (Some(r), Some(tok), Some(ms)) => format!("{base} (route:{r}, tagger: {tok} tok, {ms}ms)"),
+        (Some(r), _, _) => format!("{base} (route:{r})"),
+        _ => base,
+    }
 }
 
 pub fn arbiter_assigned(arbiter_id: &str, peer_id: &str, model: &str, tier: &str) -> String {

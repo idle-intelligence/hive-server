@@ -32,6 +32,12 @@ pub enum ClientMsg {
         text: Option<String>,
         #[serde(default)]
         messages: Option<Vec<ChatMessage>>,
+        #[serde(default)]
+        route: Option<String>,
+        #[serde(default)]
+        tagger_ms: Option<u64>,
+        #[serde(default)]
+        tagger_tokens: Option<u32>,
     },
 }
 

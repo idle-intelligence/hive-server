@@ -62,6 +62,7 @@ pub struct PendingQuestion {
     pub start: Instant,
     pub phase: QuestionPhase,
     pub task_type: TaskType,
+    pub route_tag: Option<String>,
 }
 
 #[derive(Debug)]
@@ -71,6 +72,7 @@ pub struct QueuedQuestion {
     pub text: String,
     pub messages: Vec<crate::protocol::ChatMessage>,
     pub task_type: TaskType,
+    pub route_tag: Option<String>,
     /// If Some, this queue entry is waiting for an arbiter, not generation.
     pub arbitration_for: Option<String>,
 }
@@ -89,6 +91,7 @@ pub struct HubState {
     pub low_queue: VecDeque<QueuedQuestion>,
     pub questions_today: u64,
     pub total_flops: f64,
+    pub started_at: Instant,
 }
 
 impl HubState {
@@ -103,6 +106,7 @@ impl HubState {
             low_queue: VecDeque::new(),
             questions_today: 0,
             total_flops: 0.0,
+            started_at: Instant::now(),
         }
     }
 

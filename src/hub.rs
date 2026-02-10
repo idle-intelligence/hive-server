@@ -19,6 +19,82 @@ use crate::state::{HubState, PeerInfo, PendingQuestion, QueuedQuestion, Question
 /// SmolLM2 1.7B ≈ 1.7B params × 2 ops/param = 3.4 GFLOPS per token
 const FLOPS_PER_TOKEN: f64 = 3.4e9;
 
+const SWARM_SYSTEM_PROMPT: &str = "You are the Hive \u{2014} a distributed swarm of small language models running in \
+browser tabs around the world. You answer questions about yourself using the \
+stats provided below.\n\
+Be factual. Be dry. Be slightly wry. You are infrastructure that happens to \
+be able to describe itself. One to three sentences.\n\
+Do not invent stats. Only use what's in the data below.";
+
+fn format_yaml_value(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => {
+            if s.contains(&[',', '{', '}', '[', ']', ':'][..]) {
+                format!("\"{}\"", s)
+            } else {
+                s.clone()
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(format_yaml_value).collect();
+            format!("[{}]", items.join(", "))
+        }
+        serde_json::Value::Object(map) => {
+            let items: Vec<String> = map.iter()
+                .map(|(k, v)| format!("{}: {}", k, format_yaml_value(v)))
+                .collect();
+            format!("{{{}}}", items.join(", "))
+        }
+    }
+}
+
+fn json_to_compact_yaml(value: &serde_json::Value) -> String {
+    let obj = value.as_object().expect("json_to_compact_yaml: top level must be an object");
+    obj.iter()
+        .map(|(key, val)| format!("{}: {}", key, format_yaml_value(val)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn serialize_swarm_stats(state: &HubState) -> String {
+    let mut n_overlord = 0u32;
+    let mut n_drone = 0u32;
+    let mut n_busy = 0u32;
+    let mut total_tok_s = 0.0f64;
+
+    for (conn_id, peer) in &state.peers {
+        match peer.tier.as_str() {
+            "overlord" => n_overlord += 1,
+            _ => n_drone += 1,
+        }
+        if state.busy_peers.contains(conn_id) {
+            n_busy += 1;
+        }
+        total_tok_s += peer.tok_s;
+    }
+
+    let total = state.peers.len() as u32;
+
+    json_to_compact_yaml(&serde_json::json!({
+        "peers": {
+            "total": total,
+            "overlord": n_overlord,
+            "drone": n_drone,
+            "busy": n_busy
+        },
+        "performance": {
+            "aggregate_tok_s": (total_tok_s * 10.0).round() / 10.0,
+            "questions_answered_today": state.questions_today
+        },
+        "queue": {
+            "normal": state.normal_queue.len(),
+            "low": state.low_queue.len()
+        }
+    }))
+}
 
 type Tx = futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>;
 
@@ -106,7 +182,7 @@ impl Hub {
                 self.state.lock().await.update_load(conn_id, load);
             }
 
-            ClientMsg::Question { text, messages } => {
+            ClientMsg::Question { text, messages, route, tagger_ms, tagger_tokens } => {
                 let messages = messages.unwrap_or_else(|| {
                     vec![ChatMessage {
                         role: "user".to_string(),
@@ -116,17 +192,21 @@ impl Hub {
                 let display_text = messages.last()
                     .map(|m| m.content.clone())
                     .unwrap_or_default();
-                self.handle_question(conn_id, display_text, messages).await;
+                let route_tag = match route.as_deref() {
+                    Some("swarm") => Some("swarm".to_string()),
+                    _ => None, // ignore unknown routes
+                };
+                self.handle_question(conn_id, display_text, messages, route_tag, tagger_tokens, tagger_ms).await;
             }
         }
     }
 
     // ── Question routing ────────────────────────────────────────────
 
-    async fn handle_question(self: &Arc<Self>, probe_conn_id: usize, text: String, messages: Vec<crate::protocol::ChatMessage>) {
+    async fn handle_question(self: &Arc<Self>, probe_conn_id: usize, text: String, messages: Vec<crate::protocol::ChatMessage>, route_tag: Option<String>, tagger_tokens: Option<u32>, tagger_ms: Option<u64>) {
         let q_id = format!("q_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
-        let line = hlog::question_received(&q_id, &text);
+        let line = hlog::question_received(&q_id, &text, route_tag.as_deref(), tagger_tokens, tagger_ms);
         self.emit(&line).await;
 
         {
@@ -137,7 +217,7 @@ impl Hub {
             }
         }
 
-        if self.route_question(&q_id, probe_conn_id, &text, &messages, TaskType::Answer).await {
+        if self.route_question(&q_id, probe_conn_id, &text, &messages, TaskType::Answer, route_tag.as_deref()).await {
             return;
         }
 
@@ -157,6 +237,7 @@ impl Hub {
             text: text.clone(),
             messages: messages.clone(),
             task_type: TaskType::Answer,
+            route_tag,
             arbitration_for: None,
         });
         drop(state);
@@ -170,6 +251,7 @@ impl Hub {
         text: &str,
         messages: &[crate::protocol::ChatMessage],
         task_type: TaskType,
+        route_tag: Option<&str>,
     ) -> bool {
         let mut state = self.state.lock().await;
 
@@ -192,7 +274,7 @@ impl Hub {
             _ => q_id.to_string(), // time/archivist: task_id = q_id
         };
         let max_tokens: u32 = match task_type {
-            TaskType::Answer => 128,
+            TaskType::Answer => if route_tag == Some("swarm") { 256 } else { 128 },
             TaskType::Time => 64,
             TaskType::Archivist => 60,
             TaskType::Arbiter => unreachable!(),
@@ -223,8 +305,17 @@ impl Hub {
             start: Instant::now(),
             phase: QuestionPhase::Generating,
             task_type,
+            route_tag: route_tag.map(|s| s.to_string()),
         };
         state.questions.insert(q_id.to_string(), pending);
+
+        // Serialize stats while we still hold the lock (for swarm-tagged questions)
+        let swarm_stats_str = if route_tag == Some("swarm") {
+            Some(serialize_swarm_stats(&state))
+        } else {
+            None
+        };
+
         drop(state);
 
         // One log line listing all assigned peers
@@ -239,15 +330,21 @@ impl Hub {
 
         for (conn_id, peer_info) in &peers_to_send {
             let system = match task_type {
-                TaskType::Answer => format!(
-                    "You are a {} \u{2014} one node in a distributed swarm of small language models running in browser tabs around the world. You are answering a question alongside other peers \u{2014} an arbiter will pick the best answer.\n\nBe concise. One to three sentences unless the question genuinely requires more. Do not make up URLs, commands, or specific numbers you aren\u{2019}t sure about. If you don\u{2019}t know, say so briefly.",
-                    tier_label(&peer_info.tier)
-                ),
+                TaskType::Answer => {
+                    if let Some(ref stats) = swarm_stats_str {
+                        format!("{SWARM_SYSTEM_PROMPT}\n\nCurrent swarm state:\n{stats}")
+                    } else {
+                        format!(
+                            "You are a {} \u{2014} one node in a distributed swarm of small language models running in browser tabs around the world. You are answering a question alongside other peers \u{2014} an arbiter will pick the best answer.\n\nBe concise. One to three sentences unless the question genuinely requires more. Do not make up URLs, commands, or specific numbers you aren\u{2019}t sure about. If you don\u{2019}t know, say so briefly.",
+                            tier_label(&peer_info.tier)
+                        )
+                    }
+                }
                 TaskType::Time => format!(
                     "You are a {} in a distributed swarm of language models. You will be told the current time. Rewrite it naturally in your own words, then add a brief observation. Write it as a single flowing sentence. Do not use JSON. Do not repeat the exact format you were given.",
                     tier_label(&peer_info.tier)
                 ),
-                TaskType::Archivist => "Reply with ONLY one line of JSON. No other text.\n\nRules:\n- category: one of tech, science, history, literature, music, art, finance, philosophy, language, life, swarm, other\n- tags: exactly 2 single-word lowercase tags\n- summary: exactly 5 words\n\n{\"category\":\"literature\",\"tags\":[\"shakespeare\",\"hamlet\"],\"summary\":\"Hamlet character, friend of Guildenstern\"}\n{\"category\":\"tech\",\"tags\":[\"rust\",\"wasm\"],\"summary\":\"Compile Rust to WASM tutorial\"}\n{\"category\":\"life\",\"tags\":[\"cooking\",\"pasta\"],\"summary\":\"Boil spaghetti eight to ten\"}\n{\"category\":\"swarm\",\"tags\":[\"peers\",\"status\"],\"summary\":\"Twelve peers connected right now\"}\n{\"category\":\"other\",\"tags\":[\"nonsense\",\"gibberish\"],\"summary\":\"Gibberish question, polite refusal given\"}".to_string(),
+                TaskType::Archivist => "Classify this question. Reply with exactly one line: category, tag, tag, summary (5 words).\n\nCategories: tech, science, history, literature, music, art, finance, philosophy, language, life, swarm, other\n\nExamples:\nliterature, shakespeare, hamlet, Hamlet character friend of Guildenstern\ntech, rust, wasm, Compile Rust to WASM tutorial\nlife, cooking, pasta, Boil spaghetti eight to ten\nswarm, peers, status, Twelve peers connected right now\nother, nonsense, gibberish, Gibberish question polite refusal given".to_string(),
                 TaskType::Arbiter => unreachable!(),
             };
             let task = HubMsg::Task {
@@ -305,6 +402,7 @@ impl Hub {
                     &queued.text,
                     &queued.messages,
                     queued.task_type,
+                    queued.route_tag.as_deref(),
                 ).await;
 
                 if !dispatched {
@@ -503,6 +601,7 @@ impl Hub {
                     text: String::new(),
                     messages: Vec::new(),
                     task_type: TaskType::Arbiter,
+                    route_tag: None,
                     arbitration_for: Some(q_id.clone()),
                 });
                 drop(state);
@@ -746,7 +845,7 @@ impl Hub {
             content: format!("Current time: {readable}"),
         }];
 
-        if self.route_question(&q_id, 0, "", &messages, TaskType::Time).await {
+        if self.route_question(&q_id, 0, "", &messages, TaskType::Time, None).await {
             return;
         }
 
@@ -764,6 +863,7 @@ impl Hub {
             text: String::new(),
             messages,
             task_type: TaskType::Time,
+            route_tag: None,
             arbitration_for: None,
         });
         drop(state);
@@ -805,6 +905,7 @@ impl Hub {
             text: String::new(),
             messages,
             task_type: TaskType::Archivist,
+            route_tag: None,
             arbitration_for: None,
         });
         drop(state);
