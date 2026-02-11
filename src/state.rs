@@ -43,15 +43,15 @@ pub struct TaskResult {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum QuestionPhase {
+pub enum MessagePhase {
     Generating,
     Arbitrating,
     Done,
 }
 
 #[derive(Debug)]
-pub struct PendingQuestion {
-    pub question_id: String,
+pub struct PendingMessage {
+    pub message_id: String,
     pub probe_conn_id: usize,
     pub text: String,
     pub messages: Vec<crate::protocol::ChatMessage>,
@@ -62,14 +62,14 @@ pub struct PendingQuestion {
     pub arbiter_task_id: Option<String>,
     pub arbiter_conn_id: Option<usize>,
     pub start: Instant,
-    pub phase: QuestionPhase,
+    pub phase: MessagePhase,
     pub task_type: TaskType,
     pub route_tag: Option<String>,
 }
 
 #[derive(Debug)]
-pub struct QueuedQuestion {
-    pub question_id: String,
+pub struct QueuedMessage {
+    pub message_id: String,
     pub probe_conn_id: usize,
     pub text: String,
     pub messages: Vec<crate::protocol::ChatMessage>,
@@ -85,13 +85,13 @@ const MAX_LOW_QUEUE: usize = 10;
 #[derive(Debug)]
 pub struct HubState {
     pub peers: HashMap<usize, PeerInfo>,
-    pub questions: HashMap<String, PendingQuestion>,
-    pub task_to_question: HashMap<String, String>,
+    pub messages: HashMap<String, PendingMessage>,
+    pub task_to_message: HashMap<String, String>,
     pub busy_peers: HashSet<usize>,
     pub probes: HashSet<usize>,
-    pub normal_queue: VecDeque<QueuedQuestion>,
-    pub low_queue: VecDeque<QueuedQuestion>,
-    pub questions_today: u64,
+    pub normal_queue: VecDeque<QueuedMessage>,
+    pub low_queue: VecDeque<QueuedMessage>,
+    pub messages_today: u64,
     pub total_flops: f64,
     pub started_at: Instant,
 }
@@ -100,13 +100,13 @@ impl HubState {
     pub fn new() -> Self {
         Self {
             peers: HashMap::new(),
-            questions: HashMap::new(),
-            task_to_question: HashMap::new(),
+            messages: HashMap::new(),
+            task_to_message: HashMap::new(),
             busy_peers: HashSet::new(),
             probes: HashSet::new(),
             normal_queue: VecDeque::new(),
             low_queue: VecDeque::new(),
-            questions_today: 0,
+            messages_today: 0,
             total_flops: 0.0,
             started_at: Instant::now(),
         }

@@ -36,8 +36,8 @@ pub fn task_completed(task_id: &str, peer_id: &str, tokens: u32, inference_ms: u
     )
 }
 
-pub fn question_received(q_id: &str, text: &str, route: Option<&str>, tagger_tokens: Option<u32>, tagger_ms: Option<u64>) -> String {
-    let base = format!("{} [question {}] received: \"{}\"", ts(), q_id, text);
+pub fn message_received(m_id: &str, text: &str, route: Option<&str>, tagger_tokens: Option<u32>, tagger_ms: Option<u64>) -> String {
+    let base = format!("{} [message {}] received: \"{}\"", ts(), m_id, text);
     match (route, tagger_tokens, tagger_ms) {
         (Some(r), Some(tok), Some(ms)) => format!("{base} (route:{r}, tagger: {tok} tok, {ms}ms)"),
         (Some(r), _, _) => format!("{base} (route:{r})"),
@@ -56,10 +56,10 @@ pub fn arbiter_completed(arbiter_id: &str, picked_peer: &str, candidates: usize,
     )
 }
 
-pub fn answer_delivered(q_id: &str, total_tokens: u32, total_secs: f64, peers_used: u32) -> String {
+pub fn response_delivered(m_id: &str, total_tokens: u32, total_secs: f64, peers_used: u32) -> String {
     format!(
-        "{} [answer {}] delivered ({} total tok, {:.1}s, {} peers)",
-        ts(), q_id, total_tokens, total_secs, peers_used
+        "{} [response {}] delivered ({} total tok, {:.1}s, {} peers)",
+        ts(), m_id, total_tokens, total_secs, peers_used
     )
 }
 
@@ -75,8 +75,8 @@ pub fn time_skipped() -> String {
     format!("{} [time] skipped — no peers available", ts())
 }
 
-pub fn queue_full(q_id: &str) -> String {
-    format!("{} [queue] {} rejected — queue full", ts(), q_id)
+pub fn queue_full(m_id: &str) -> String {
+    format!("{} [queue] {} rejected — queue full", ts(), m_id)
 }
 
 pub fn archivist_result(task_id: &str, text: &str) -> String {
@@ -91,7 +91,7 @@ pub fn swarm_status(peer_count: usize) -> String {
     format!("{} [swarm] {} Peer connected", ts(), peer_count)
 }
 
-pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: usize, questions_today: u64, total_flops: f64) -> (String, Option<String>) {
+pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: usize, messages_today: u64, total_flops: f64) -> (String, Option<String>) {
     let total = peers.len();
     let mut total_tok_s = 0.0;
     let mut size_counts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
@@ -107,8 +107,8 @@ pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: u
         .join(", ");
 
     let peer_line = format!(
-        "{} [swarm] {} Peer: {} | {:.1} tok/s | {} Question | {:.2e} total FLOPS",
-        ts(), total, sizes, total_tok_s, questions_today, total_flops
+        "{} [swarm] {} Peer: {} | {:.1} tok/s | {} Message | {:.2e} total FLOPS",
+        ts(), total, sizes, total_tok_s, messages_today, total_flops
     );
 
     let clients = probes + observers;
