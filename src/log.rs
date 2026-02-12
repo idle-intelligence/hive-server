@@ -36,10 +36,10 @@ pub fn task_completed(task_id: &str, peer_id: &str, tokens: u32, inference_ms: u
     )
 }
 
-pub fn message_received(m_id: &str, text: &str, route: Option<&str>, tagger_tokens: Option<u32>, tagger_ms: Option<u64>) -> String {
+pub fn message_received(m_id: &str, text: &str, route: Option<&str>, classifier_score: Option<f64>, classifier_ms: Option<u64>) -> String {
     let base = format!("{} [message {}] received: \"{}\"", ts(), m_id, text);
-    match (route, tagger_tokens, tagger_ms) {
-        (Some(r), Some(tok), Some(ms)) => format!("{base} (route:{r}, tagger: {tok} tok, {ms}ms)"),
+    match (route, classifier_score, classifier_ms) {
+        (Some(r), Some(score), Some(ms)) => format!("{base} (route:{r}, classifier: {score:.2} score, {ms}ms)"),
         (Some(r), _, _) => format!("{base} (route:{r})"),
         _ => base,
     }

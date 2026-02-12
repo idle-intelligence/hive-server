@@ -36,9 +36,9 @@ pub enum ClientMsg {
         #[serde(default)]
         route: Option<String>,
         #[serde(default)]
-        tagger_ms: Option<u64>,
+        classifier_ms: Option<u64>,
         #[serde(default)]
-        tagger_tokens: Option<u32>,
+        classifier_score: Option<f64>,
     },
 }
 

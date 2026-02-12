@@ -246,7 +246,7 @@ impl Hub {
                 self.state.lock().await.update_load(conn_id, load);
             }
 
-            ClientMsg::Message { text, messages, route, tagger_ms, tagger_tokens } => {
+            ClientMsg::Message { text, messages, route, classifier_ms, classifier_score } => {
                 let messages = messages.unwrap_or_else(|| {
                     vec![ChatMessage {
                         role: "user".to_string(),
@@ -258,9 +258,11 @@ impl Hub {
                     .unwrap_or_default();
                 let route_tag = match route.as_deref() {
                     Some("swarm") => Some("swarm".to_string()),
-                    _ => None, // ignore unknown routes
+                    Some("time") => Some("time".to_string()),
+                    Some("weather") => Some("weather".to_string()),
+                    _ => None,
                 };
-                self.process_incoming_message(conn_id, display_text, messages, route_tag, tagger_tokens, tagger_ms).await;
+                self.process_incoming_message(conn_id, display_text, messages, route_tag, classifier_score, classifier_ms).await;
             }
         }
     }
@@ -317,18 +319,29 @@ impl Hub {
 
     // ── Question routing ────────────────────────────────────────────
 
-    async fn process_incoming_message(self: &Arc<Self>, probe_conn_id: usize, text: String, messages: Vec<crate::protocol::ChatMessage>, route_tag: Option<String>, tagger_tokens: Option<u32>, tagger_ms: Option<u64>) {
+    async fn process_incoming_message(self: &Arc<Self>, probe_conn_id: usize, text: String, messages: Vec<crate::protocol::ChatMessage>, route_tag: Option<String>, classifier_score: Option<f64>, classifier_ms: Option<u64>) {
         let m_id = format!("m_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
-        let line = hlog::message_received(&m_id, &text, route_tag.as_deref(), tagger_tokens, tagger_ms);
+        let line = hlog::message_received(&m_id, &text, route_tag.as_deref(), classifier_score, classifier_ms);
         self.emit(&line).await;
 
-        {
+        let is_peer = {
             let mut state = self.state.lock().await;
             state.messages_today += 1;
-            if !state.peers.contains_key(&probe_conn_id) {
+            let is_peer = state.peers.contains_key(&probe_conn_id);
+            if !is_peer {
                 state.probes.insert(probe_conn_id);
             }
+            is_peer
+        };
+
+        // Observer gating: reject swarm-tagged messages from non-peers
+        if route_tag.as_deref() == Some("swarm") && !is_peer {
+            let line = format!("{} [error] {} attempted swarm message without joining", hlog::ts(), m_id);
+            self.emit(&line).await;
+            let err = HubMsg::Error { text: "Join the swarm to know the swarm.".to_string() };
+            self.send_to(probe_conn_id, &err).await;
+            return;
         }
 
         if self.route_message(&m_id, probe_conn_id, &text, &messages, TaskType::Answer, route_tag.as_deref()).await {
