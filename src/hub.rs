@@ -64,7 +64,7 @@ fn serialize_swarm_stats(state: &HubState) -> String {
     let mut total_tok_s = 0.0f64;
 
     for (conn_id, peer) in &state.peers {
-        if state.busy_peers.contains(conn_id) {
+        if state.busy_answerers.contains(conn_id) {
             n_busy += 1;
         }
         total_tok_s += peer.tok_s;
@@ -146,7 +146,8 @@ impl Hub {
 
     async fn handle_message(self: &Arc<Self>, conn_id: usize, msg: ClientMsg) {
         match msg {
-            ClientMsg::Register { peer_id, model, model_size, tok_s } => {
+            ClientMsg::Register { peer_id, model, model_size, tok_s, capabilities } => {
+                let _ = capabilities; // Will be used in Task #3
                 let line = hlog::peer_joined_benchmarking(&peer_id, &model, &model_size);
                 self.emit(&line).await;
 
@@ -156,6 +157,11 @@ impl Hub {
                     model_size,
                     tok_s: tok_s.unwrap_or(0.0),
                     load: 0.0,
+                    capabilities: {
+                        let mut caps = std::collections::HashSet::new();
+                        caps.insert(crate::state::Capability::Answerer);
+                        caps
+                    },
                 };
 
                 let bench_task_id = format!("bench_{}", peer_id);
@@ -173,7 +179,7 @@ impl Hub {
                     if let Some(old_id) = stale_conn_id {
                         // Remove stale entry from peers and busy_peers
                         state.peers.remove(&old_id);
-                        state.busy_peers.remove(&old_id);
+                        state.busy_answerers.remove(&old_id);
 
                         // Clean up any pending tasks assigned to the old conn_id
                         let mut tasks_to_remove = Vec::new();
@@ -191,7 +197,7 @@ impl Hub {
                     }
 
                     state.add_peer(conn_id, info);
-                    state.busy_peers.insert(conn_id);
+                    state.busy_answerers.insert(conn_id);
                     stats_str = serialize_swarm_stats(&state);
                     state.task_to_message.insert(bench_task_id.clone(), bench_m_id.clone());
                     state.messages.insert(bench_m_id.clone(), PendingMessage {
@@ -209,6 +215,8 @@ impl Hub {
                         phase: MessagePhase::Generating,
                         task_type: TaskType::Benchmark,
                         route_tag: None,
+                        classify_task_id: None,
+                        classify_conn_id: None,
                     });
                 }
 
@@ -234,6 +242,7 @@ impl Hub {
                         content: "How many peers are there in the swarm?".to_string(),
                     }],
                     max_tokens: 128,
+                    text: None,
                 };
                 self.send_to(conn_id, &task).await;
             }
@@ -382,12 +391,12 @@ impl Hub {
     ) -> bool {
         let mut state = self.state.lock().await;
 
-        let mut exclude = state.busy_peers.clone();
+        let mut exclude = state.busy_answerers.clone();
         exclude.insert(probe_conn_id);
         let n_peers = match task_type {
             TaskType::Answer => 3,
             TaskType::Time | TaskType::Archivist => 1,
-            TaskType::Arbiter | TaskType::Benchmark => unreachable!(),
+            TaskType::Arbiter | TaskType::Benchmark | TaskType::Classify => unreachable!(),
         };
         let selected = router::select_peers(&state.peers, &exclude, n_peers);
 
@@ -404,7 +413,7 @@ impl Hub {
             TaskType::Answer => if route_tag == Some("swarm") { 256 } else { 128 },
             TaskType::Time => 64,
             TaskType::Archivist => 60,
-            TaskType::Arbiter | TaskType::Benchmark => unreachable!(),
+            TaskType::Arbiter | TaskType::Benchmark | TaskType::Classify => unreachable!(),
         };
 
         let mut gen_peers = Vec::new();
@@ -412,7 +421,7 @@ impl Hub {
 
         for (conn_id, peer_info) in &selected {
             gen_peers.push(*conn_id);
-            state.busy_peers.insert(*conn_id);
+            state.busy_answerers.insert(*conn_id);
             peers_to_send.push((*conn_id, peer_info.clone()));
         }
 
@@ -433,6 +442,8 @@ impl Hub {
             phase: MessagePhase::Generating,
             task_type,
             route_tag: route_tag.map(|s| s.to_string()),
+            classify_task_id: None,
+            classify_conn_id: None,
         };
         state.messages.insert(m_id.to_string(), pending);
 
@@ -468,7 +479,7 @@ impl Hub {
                 }
                 TaskType::Time => "You are a drone in a distributed swarm of language models. You will be told the current time. Rewrite it naturally in your own words, then add a brief observation. Write it as a single flowing sentence. Do not use JSON. Do not repeat the exact format you were given.".to_string(),
                 TaskType::Archivist => "You are a summarizer. Summarize the question in exactly 5 words. Output ONLY the summary, nothing else.".to_string(),
-                TaskType::Arbiter | TaskType::Benchmark => unreachable!(),
+                TaskType::Arbiter | TaskType::Benchmark | TaskType::Classify => unreachable!(),
             };
             // Truncate messages to fit peer's context window
             let truncated_messages = Self::truncate_messages(messages, &system, max_tokens);
@@ -479,6 +490,7 @@ impl Hub {
                 system,
                 messages: truncated_messages,
                 max_tokens,
+                text: None,
             };
             self.send_to(*conn_id, &task).await;
         }
@@ -500,7 +512,7 @@ impl Hub {
         loop {
             let queued = {
                 let mut state = self.state.lock().await;
-                let has_idle = state.peers.keys().any(|id| !state.busy_peers.contains(id));
+                let has_idle = state.peers.keys().any(|id| !state.busy_answerers.contains(id));
                 if !has_idle {
                     break;
                 }
@@ -535,7 +547,7 @@ impl Hub {
                     match queued.task_type {
                         TaskType::Answer | TaskType::Arbiter => state.normal_queue.push_front(queued),
                         TaskType::Time | TaskType::Archivist => state.low_queue.push_front(queued),
-                        TaskType::Benchmark => unreachable!(),
+                        TaskType::Benchmark | TaskType::Classify => unreachable!(),
                     }
                     break;
                 }
@@ -574,7 +586,7 @@ impl Hub {
                 .map(|p| p.peer_id.clone())
                 .unwrap_or_else(|| format!("conn_{conn_id}"));
             let message_id = state.task_to_message.get(&task_id).cloned();
-            state.busy_peers.remove(&conn_id);
+            state.busy_answerers.remove(&conn_id);
 
             let is_benchmark = message_id.as_ref()
                 .and_then(|qid| state.messages.get(qid))
@@ -777,7 +789,7 @@ impl Hub {
         let probe = message.probe_conn_id;
 
         // Build exclude set: generation peers + busy peers + probe
-        let mut exclude = state.busy_peers.clone();
+        let mut exclude = state.busy_answerers.clone();
         for &conn_id in &gen_conn_ids {
             exclude.insert(conn_id);
         }
@@ -812,7 +824,7 @@ impl Hub {
             message.phase = MessagePhase::Arbitrating;
 
             state.task_to_message.insert(arbiter_task_id.clone(), message_id.to_string());
-            state.busy_peers.insert(arbiter_conn_id);
+            state.busy_answerers.insert(arbiter_conn_id);
             drop(state);
 
             let line = hlog::arbiter_assigned(
@@ -827,6 +839,7 @@ impl Hub {
                 system: arbiter_system,
                 messages: truncated_arbiter_messages,
                 max_tokens: 8,
+                text: None,
             };
             self.send_to(arbiter_conn_id, &task).await;
             true
@@ -943,6 +956,9 @@ impl Hub {
                     peers_used,
                 };
                 self.send_to(probe, &response).await;
+            }
+            MessagePhase::Classifying => {
+                // Classify timeout handling added in Task #4
             }
             MessagePhase::Done => {}
         }
