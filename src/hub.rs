@@ -88,6 +88,15 @@ fn serialize_swarm_stats(state: &HubState) -> String {
     }))
 }
 
+fn build_time_query_messages(user_text: &str) -> Vec<ChatMessage> {
+    let now = chrono::Utc::now();
+    let readable = now.format("%A, %B %-d, %Y, %H:%M UTC").to_string();
+    vec![ChatMessage {
+        role: "user".to_string(),
+        content: format!("Current time: {readable}\n\nUser asked: {user_text}"),
+    }]
+}
+
 type Tx = futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>;
 
 static NEXT_CONN_ID: AtomicUsize = AtomicUsize::new(1);
@@ -312,7 +321,7 @@ impl Hub {
 
                 let system = format!("{SWARM_SYSTEM_PROMPT}\n\nCurrent swarm state:\n{stats_str}");
                 let task = HubMsg::Task {
-                    task_id: bench_task_id,
+                    task_id: bench_task_id.clone(),
                     message_id: None,
                     task_type: "benchmark".to_string(),
                     system,
@@ -323,7 +332,13 @@ impl Hub {
                     max_tokens: 128,
                     text: None,
                 };
-                self.send_to(conn_id, &task).await;
+                // m5 fix: check send result and remove from busy on failure
+                if !self.send_to(conn_id, &task).await {
+                    let mut state = self.state.lock().await;
+                    state.busy_answerers.remove(&conn_id);
+                    state.task_to_message.remove(&bench_task_id);
+                    state.messages.remove(&bench_m_id);
+                }
             }
 
             ClientMsg::Result { task_id, text, tok_s, tokens, inference_ms } => {
@@ -344,6 +359,14 @@ impl Hub {
                 let display_text = messages.last()
                     .map(|m| m.content.clone())
                     .unwrap_or_default();
+
+                // Enforce 1000-character limit (v1-protocol.md)
+                if display_text.chars().count() > 1000 {
+                    let err = HubMsg::Error { text: "Message too long (max 1000 characters)".to_string() };
+                    self.send_to(conn_id, &err).await;
+                    return;
+                }
+
                 let route_tag = match route.as_deref() {
                     Some("swarm") => Some("swarm".to_string()),
                     Some("time") => Some("time".to_string()),
@@ -431,6 +454,33 @@ impl Hub {
                 self.emit(&line).await;
                 let err = HubMsg::Error { text: "Join the swarm to know the swarm.".to_string() };
                 self.send_to(probe_conn_id, &err).await;
+                return;
+            }
+
+            // Time route: 1 peer, no arbiter, inject current UTC time
+            if route_tag.as_deref() == Some("time") {
+                let time_messages = build_time_query_messages(&text);
+                if self.route_message(&m_id, probe_conn_id, &text, &time_messages, TaskType::Time, route_tag.as_deref()).await {
+                    return;
+                }
+                let mut state = self.state.lock().await;
+                if state.normal_queue_full() {
+                    drop(state);
+                    let line = hlog::queue_full(&m_id);
+                    self.emit(&line).await;
+                    let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
+                    self.send_to(probe_conn_id, &err).await;
+                } else {
+                    state.normal_queue.push_back(QueuedMessage {
+                        message_id: m_id.clone(),
+                        probe_conn_id,
+                        text: text.clone(),
+                        messages: time_messages,
+                        task_type: TaskType::Time,
+                        route_tag,
+                        arbitration_for: None,
+                    });
+                }
                 return;
             }
 
@@ -821,11 +871,19 @@ impl Hub {
         self: &Arc<Self>,
         conn_id: usize,
         task_id: String,
-        text: String,
+        mut text: String,
         tok_s: f64,
         tokens: u32,
         inference_ms: u64,
     ) {
+        // Enforce 2000-character limit on result text (v1-protocol.md)
+        if text.chars().count() > 2000 {
+            let line = format!("{} [error] result for task {} exceeds 2000 chars, truncating", hlog::ts(), task_id);
+            self.emit(&line).await;
+            // Truncate to 2000 chars (note: we truncate rather than reject since the peer already did the work)
+            text = text.chars().take(2000).collect();
+        }
+
         // 1. Get peer info, unmark busy, look up message. Handle benchmarks and classify inline.
         let (peer_id, message_id, is_benchmark, is_classify) = {
             let mut state = self.state.lock().await;
@@ -945,8 +1003,15 @@ impl Hub {
                 state.task_to_message.remove(&task_id);
             }
 
+            // Determine task type and messages based on route
+            let (task_type, routed_messages) = if route_tag.as_deref() == Some("time") {
+                (TaskType::Time, build_time_query_messages(&text))
+            } else {
+                (TaskType::Answer, messages)
+            };
+
             // Transition to Generating and route
-            if self.route_message(&message_id, probe_conn_id, &text, &messages, TaskType::Answer, route_tag.as_deref()).await {
+            if self.route_message(&message_id, probe_conn_id, &text, &routed_messages, task_type, route_tag.as_deref()).await {
                 return;
             }
 
@@ -963,8 +1028,8 @@ impl Hub {
                     message_id: message_id.clone(),
                     probe_conn_id,
                     text,
-                    messages,
-                    task_type: TaskType::Answer,
+                    messages: routed_messages,
+                    task_type,
                     route_tag,
                     arbitration_for: None,
                 });
@@ -1049,13 +1114,34 @@ impl Hub {
         if message.task_type == TaskType::Time {
             let first = message.results[0].clone();
             let flops = first.tokens as f64 * FLOPS_PER_TOKEN;
+            let probe = message.probe_conn_id;
+            let m_id = message.message_id.clone();
+            let m_text = message.text.clone();
+            let elapsed_ms = message.start.elapsed().as_millis() as u64;
             message.phase = MessagePhase::Done;
-            // question borrow ends here — now safe to mutate state directly
             state.total_flops += flops;
             drop(state);
 
             let line = hlog::time_result(&first.peer_id, &first.text, first.tokens, flops);
             self.emit(&line).await;
+
+            // User-initiated time query: send response back
+            if probe != 0 {
+                let total_secs = elapsed_ms as f64 / 1000.0;
+                let line = hlog::response_delivered(&m_id, first.tokens, total_secs, 1);
+                self.emit(&line).await;
+
+                let response = HubMsg::Response {
+                    message_id: m_id.clone(),
+                    text: first.text.clone(),
+                    peer_id: first.peer_id.clone(),
+                    total_tokens: first.tokens,
+                    total_ms: elapsed_ms,
+                    peers_used: 1,
+                };
+                self.send_to(probe, &response).await;
+                self.queue_archivist(&m_id, &m_text, &first.text).await;
+            }
             return;
         }
 
@@ -1270,6 +1356,11 @@ impl Hub {
                         let probe = message.probe_conn_id;
                         let peers_used = message.results.len() as u32;
                         message.phase = MessagePhase::Done;
+
+                        // Remove any queued arbiter entry for this message (m4 fix)
+                        state.normal_queue.retain(|q| {
+                            q.arbitration_for.as_ref() != Some(&m_id)
+                        });
                         drop(state);
 
                         let line = format!(
@@ -1302,6 +1393,11 @@ impl Hub {
                 let m_id = message_id.to_string();
                 let peers_used = message.results.len() as u32;
                 message.phase = MessagePhase::Done;
+
+                // Remove any queued arbiter entry for this message (m4 fix)
+                state.normal_queue.retain(|q| {
+                    q.arbitration_for.as_ref() != Some(&m_id)
+                });
                 drop(state);
 
                 let line = format!(
@@ -1470,13 +1566,17 @@ impl Hub {
         }
     }
 
-    async fn send_to(&self, conn_id: usize, msg: &HubMsg) {
+    async fn send_to(&self, conn_id: usize, msg: &HubMsg) -> bool {
         let json = serde_json::to_string(msg).unwrap();
         let mut senders = self.senders.lock().await;
         if let Some(tx) = senders.get_mut(&conn_id) {
             if tx.send(Message::Text(json)).await.is_err() {
                 senders.remove(&conn_id);
+                return false;
             }
+            true
+        } else {
+            false
         }
     }
 }

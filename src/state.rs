@@ -36,7 +36,7 @@ pub struct PeerInfo {
     pub model: String,
     pub model_size: String,
     pub tok_s: f64,
-    pub load: f64,
+    pub load: f64,  // TODO: V2 weighted routing (currently updated via heartbeat but not used)
     pub capabilities: HashSet<Capability>,
 }
 
@@ -106,7 +106,6 @@ pub struct HubState {
     pub low_queue: VecDeque<QueuedMessage>,
     pub messages_today: u64,
     pub total_flops: f64,
-    pub started_at: Instant,
 }
 
 impl HubState {
@@ -122,7 +121,6 @@ impl HubState {
             low_queue: VecDeque::new(),
             messages_today: 0,
             total_flops: 0.0,
-            started_at: Instant::now(),
         }
     }
 
