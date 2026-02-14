@@ -859,7 +859,7 @@ impl Hub {
             };
 
             // Log classify completion
-            let line = hlog::classify_completed(&task_id, &peer_id, &route_label, score, inference_ms);
+            let line = hlog::classify_completed(&task_id, &peer_id, &route_label, score, inference_ms, route_tag.is_some());
             self.emit(&line).await;
 
             // Get message details for observer gating and routing

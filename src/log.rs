@@ -99,8 +99,12 @@ pub fn classify_assigned(task_id: &str, peer_id: &str) -> String {
     format!("{} [classify {}] assigned to {}", ts(), task_id, peer_id)
 }
 
-pub fn classify_completed(task_id: &str, peer_id: &str, route: &str, score: f64, ms: u64) -> String {
-    format!("{} [classify {}] {} → \"{}\" ({:.2}, {}ms)", ts(), task_id, peer_id, route, score, ms)
+pub fn classify_completed(task_id: &str, peer_id: &str, route: &str, score: f64, ms: u64, routed: bool) -> String {
+    if routed {
+        format!("{} [classify {}] {} → \"{}\" ({:.2}, {}ms)", ts(), task_id, peer_id, route, score, ms)
+    } else {
+        format!("{} [classify {}] {} → \"{}\" ({:.2}, {}ms) below threshold, unrouted", ts(), task_id, peer_id, route, score, ms)
+    }
 }
 
 pub fn classify_timeout(task_id: &str) -> String {
