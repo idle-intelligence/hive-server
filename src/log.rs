@@ -12,8 +12,16 @@ pub fn peer_joined_benchmarking(peer_id: &str, model: &str, model_size: &str) ->
     format!("{} [peer] {} joined ({}, {}, benchmarking...)", ts(), peer_id, model, model_size)
 }
 
+pub fn peer_joined_tagger(peer_id: &str, model: &str, model_size: &str) -> String {
+    format!("{} [peer] {} joined ({}, {}, tagger-only)", ts(), peer_id, model, model_size)
+}
+
 pub fn peer_ready(peer_id: &str, tok_s: f64) -> String {
     format!("{} [peer] {} ready ({:.1} tok/s)", ts(), peer_id, tok_s)
+}
+
+pub fn peer_ready_tagger(peer_id: &str) -> String {
+    format!("{} [peer] {} ready", ts(), peer_id)
 }
 
 pub fn peer_left(peer_id: &str, reason: &str) -> String {

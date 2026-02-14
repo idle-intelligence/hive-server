@@ -147,26 +147,44 @@ impl Hub {
     async fn handle_message(self: &Arc<Self>, conn_id: usize, msg: ClientMsg) {
         match msg {
             ClientMsg::Register { peer_id, model, model_size, tok_s, capabilities } => {
-                let _ = capabilities; // Will be used in Task #3
-                let line = hlog::peer_joined_benchmarking(&peer_id, &model, &model_size);
+                // Parse capabilities (default to [Answerer] for backward compat)
+                let parsed_capabilities: std::collections::HashSet<crate::state::Capability> =
+                    capabilities
+                        .as_ref()
+                        .map(|caps| {
+                            caps.iter()
+                                .filter_map(|s| match s.as_str() {
+                                    "tagger" => Some(crate::state::Capability::Tagger),
+                                    "answerer" => Some(crate::state::Capability::Answerer),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_else(|| {
+                            let mut caps = std::collections::HashSet::new();
+                            caps.insert(crate::state::Capability::Answerer);
+                            caps
+                        });
+
+                let has_answerer = parsed_capabilities.contains(&crate::state::Capability::Answerer);
+
+                // Emit join log
+                let line = if has_answerer {
+                    hlog::peer_joined_benchmarking(&peer_id, &model, &model_size)
+                } else {
+                    hlog::peer_joined_tagger(&peer_id, &model, &model_size)
+                };
                 self.emit(&line).await;
 
                 let info = PeerInfo {
                     peer_id: peer_id.clone(),
-                    model,
-                    model_size,
+                    model: model.clone(),
+                    model_size: model_size.clone(),
                     tok_s: tok_s.unwrap_or(0.0),
                     load: 0.0,
-                    capabilities: {
-                        let mut caps = std::collections::HashSet::new();
-                        caps.insert(crate::state::Capability::Answerer);
-                        caps
-                    },
+                    capabilities: parsed_capabilities,
                 };
 
-                let bench_task_id = format!("bench_{}", peer_id);
-                let bench_m_id = format!("benchm_{}", peer_id);
-                let stats_str;
                 let stale_conn_id;
                 {
                     let mut state = self.state.lock().await;
@@ -177,9 +195,10 @@ impl Hub {
                         .map(|(conn_id, _)| *conn_id);
 
                     if let Some(old_id) = stale_conn_id {
-                        // Remove stale entry from peers and busy_peers
+                        // Remove stale entry from peers and busy sets
                         state.peers.remove(&old_id);
                         state.busy_answerers.remove(&old_id);
+                        state.busy_taggers.remove(&old_id);
 
                         // Clean up any pending tasks assigned to the old conn_id
                         let mut tasks_to_remove = Vec::new();
@@ -197,6 +216,32 @@ impl Hub {
                     }
 
                     state.add_peer(conn_id, info);
+                }
+
+                // Remove old connection's sender if we evicted a stale entry
+                if let Some(old_id) = stale_conn_id {
+                    self.senders.lock().await.remove(&old_id);
+                    let line = format!("{} [peer] {} reconnected (replaced stale connection)", hlog::ts(), peer_id);
+                    self.emit(&line).await;
+                }
+
+                let count = self.state.lock().await.peer_count();
+                let status = hlog::swarm_status(count);
+                self.emit(&status).await;
+
+                // Tagger-only peers skip benchmark
+                if !has_answerer {
+                    let line = hlog::peer_ready_tagger(&peer_id);
+                    self.emit(&line).await;
+                    return;
+                }
+
+                // Answerer peers: run benchmark
+                let bench_task_id = format!("bench_{}", peer_id);
+                let bench_m_id = format!("benchm_{}", peer_id);
+                let stats_str;
+                {
+                    let mut state = self.state.lock().await;
                     state.busy_answerers.insert(conn_id);
                     stats_str = serialize_swarm_stats(&state);
                     state.task_to_message.insert(bench_task_id.clone(), bench_m_id.clone());
@@ -219,17 +264,6 @@ impl Hub {
                         classify_conn_id: None,
                     });
                 }
-
-                // Remove old connection's sender if we evicted a stale entry
-                if let Some(old_id) = stale_conn_id {
-                    self.senders.lock().await.remove(&old_id);
-                    let line = format!("{} [peer] {} reconnected (replaced stale connection)", hlog::ts(), peer_id);
-                    self.emit(&line).await;
-                }
-
-                let count = self.state.lock().await.peer_count();
-                let status = hlog::swarm_status(count);
-                self.emit(&status).await;
 
                 let system = format!("{SWARM_SYSTEM_PROMPT}\n\nCurrent swarm state:\n{stats_str}");
                 let task = HubMsg::Task {
