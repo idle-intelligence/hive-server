@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,7 +64,7 @@ fn serialize_swarm_stats(state: &HubState) -> String {
     let mut total_tok_s = 0.0f64;
 
     for (conn_id, peer) in &state.peers {
-        if state.busy_peers.contains(conn_id) {
+        if state.busy_answerers.contains(conn_id) {
             n_busy += 1;
         }
         total_tok_s += peer.tok_s;
@@ -134,6 +134,50 @@ impl Hub {
         let removed = self.state.lock().await.remove_peer(conn_id);
         self.senders.lock().await.remove(&conn_id);
 
+        // Handle classify disconnect: find messages stuck in Classifying phase with this peer
+        let classify_fallback_messages: Vec<(String, usize, String, Vec<crate::protocol::ChatMessage>)> = {
+            let state = self.state.lock().await;
+            state.messages.iter()
+                .filter(|(_, msg)| {
+                    msg.phase == MessagePhase::Classifying
+                        && msg.classify_conn_id == Some(conn_id)
+                })
+                .map(|(m_id, msg)| {
+                    (m_id.clone(), msg.probe_conn_id, msg.text.clone(), msg.messages.clone())
+                })
+                .collect()
+        };
+
+        for (m_id, probe_conn_id, text, messages) in classify_fallback_messages {
+            let line = format!("{} [classify] tagger disconnected, proceeding unrouted", hlog::ts());
+            self.emit(&line).await;
+
+            // Transition to Generating with route_tag=None
+            if self.route_message(&m_id, probe_conn_id, &text, &messages, TaskType::Answer, None).await {
+                continue;
+            }
+
+            // Queue or reject
+            let mut state = self.state.lock().await;
+            if state.normal_queue_full() {
+                drop(state);
+                let line = hlog::queue_full(&m_id);
+                self.emit(&line).await;
+                let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
+                self.send_to(probe_conn_id, &err).await;
+            } else {
+                state.normal_queue.push_back(QueuedMessage {
+                    message_id: m_id.clone(),
+                    probe_conn_id,
+                    text,
+                    messages,
+                    task_type: TaskType::Answer,
+                    route_tag: None,
+                    arbitration_for: None,
+                });
+            }
+        }
+
         if let Some(peer) = removed {
             let line = hlog::peer_left(&peer.peer_id, "disconnected");
             self.emit(&line).await;
@@ -146,21 +190,45 @@ impl Hub {
 
     async fn handle_message(self: &Arc<Self>, conn_id: usize, msg: ClientMsg) {
         match msg {
-            ClientMsg::Register { peer_id, model, model_size, tok_s } => {
-                let line = hlog::peer_joined_benchmarking(&peer_id, &model, &model_size);
+            ClientMsg::Register { peer_id, model, model_size, tok_s, capabilities } => {
+                // Parse capabilities (default to [Answerer] for backward compat)
+                let parsed_capabilities: std::collections::HashSet<crate::state::Capability> =
+                    capabilities
+                        .as_ref()
+                        .map(|caps| {
+                            caps.iter()
+                                .filter_map(|s| match s.as_str() {
+                                    "tagger" => Some(crate::state::Capability::Tagger),
+                                    "answerer" => Some(crate::state::Capability::Answerer),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_else(|| {
+                            let mut caps = std::collections::HashSet::new();
+                            caps.insert(crate::state::Capability::Answerer);
+                            caps
+                        });
+
+                let has_answerer = parsed_capabilities.contains(&crate::state::Capability::Answerer);
+
+                // Emit join log
+                let line = if has_answerer {
+                    hlog::peer_joined_benchmarking(&peer_id, &model, &model_size)
+                } else {
+                    hlog::peer_joined_tagger(&peer_id, &model, &model_size)
+                };
                 self.emit(&line).await;
 
                 let info = PeerInfo {
                     peer_id: peer_id.clone(),
-                    model,
-                    model_size,
+                    model: model.clone(),
+                    model_size: model_size.clone(),
                     tok_s: tok_s.unwrap_or(0.0),
                     load: 0.0,
+                    capabilities: parsed_capabilities,
                 };
 
-                let bench_task_id = format!("bench_{}", peer_id);
-                let bench_m_id = format!("benchm_{}", peer_id);
-                let stats_str;
                 let stale_conn_id;
                 {
                     let mut state = self.state.lock().await;
@@ -171,9 +239,10 @@ impl Hub {
                         .map(|(conn_id, _)| *conn_id);
 
                     if let Some(old_id) = stale_conn_id {
-                        // Remove stale entry from peers and busy_peers
+                        // Remove stale entry from peers and busy sets
                         state.peers.remove(&old_id);
-                        state.busy_peers.remove(&old_id);
+                        state.busy_answerers.remove(&old_id);
+                        state.busy_taggers.remove(&old_id);
 
                         // Clean up any pending tasks assigned to the old conn_id
                         let mut tasks_to_remove = Vec::new();
@@ -191,7 +260,33 @@ impl Hub {
                     }
 
                     state.add_peer(conn_id, info);
-                    state.busy_peers.insert(conn_id);
+                }
+
+                // Remove old connection's sender if we evicted a stale entry
+                if let Some(old_id) = stale_conn_id {
+                    self.senders.lock().await.remove(&old_id);
+                    let line = format!("{} [peer] {} reconnected (replaced stale connection)", hlog::ts(), peer_id);
+                    self.emit(&line).await;
+                }
+
+                let count = self.state.lock().await.peer_count();
+                let status = hlog::swarm_status(count);
+                self.emit(&status).await;
+
+                // Tagger-only peers skip benchmark
+                if !has_answerer {
+                    let line = hlog::peer_ready_tagger(&peer_id);
+                    self.emit(&line).await;
+                    return;
+                }
+
+                // Answerer peers: run benchmark
+                let bench_task_id = format!("bench_{}", peer_id);
+                let bench_m_id = format!("benchm_{}", peer_id);
+                let stats_str;
+                {
+                    let mut state = self.state.lock().await;
+                    state.busy_answerers.insert(conn_id);
                     stats_str = serialize_swarm_stats(&state);
                     state.task_to_message.insert(bench_task_id.clone(), bench_m_id.clone());
                     state.messages.insert(bench_m_id.clone(), PendingMessage {
@@ -209,19 +304,10 @@ impl Hub {
                         phase: MessagePhase::Generating,
                         task_type: TaskType::Benchmark,
                         route_tag: None,
+                        classify_task_id: None,
+                        classify_conn_id: None,
                     });
                 }
-
-                // Remove old connection's sender if we evicted a stale entry
-                if let Some(old_id) = stale_conn_id {
-                    self.senders.lock().await.remove(&old_id);
-                    let line = format!("{} [peer] {} reconnected (replaced stale connection)", hlog::ts(), peer_id);
-                    self.emit(&line).await;
-                }
-
-                let count = self.state.lock().await.peer_count();
-                let status = hlog::swarm_status(count);
-                self.emit(&status).await;
 
                 let system = format!("{SWARM_SYSTEM_PROMPT}\n\nCurrent swarm state:\n{stats_str}");
                 let task = HubMsg::Task {
@@ -234,6 +320,7 @@ impl Hub {
                         content: "How many peers are there in the swarm?".to_string(),
                     }],
                     max_tokens: 128,
+                    text: None,
                 };
                 self.send_to(conn_id, &task).await;
             }
@@ -335,17 +422,31 @@ impl Hub {
             is_peer
         };
 
-        // Observer gating: reject swarm-tagged messages from non-peers
-        if route_tag.as_deref() == Some("swarm") && !is_peer {
-            let line = format!("{} [error] {} attempted swarm message without joining", hlog::ts(), m_id);
-            self.emit(&line).await;
-            let err = HubMsg::Error { text: "Join the swarm to know the swarm.".to_string() };
-            self.send_to(probe_conn_id, &err).await;
-            return;
-        }
+        // Check if route is already present (local classification)
+        if route_tag.is_some() {
+            // Observer gating: reject swarm-tagged messages from non-peers
+            if route_tag.as_deref() == Some("swarm") && !is_peer {
+                let line = format!("{} [error] {} attempted swarm message without joining", hlog::ts(), m_id);
+                self.emit(&line).await;
+                let err = HubMsg::Error { text: "Join the swarm to know the swarm.".to_string() };
+                self.send_to(probe_conn_id, &err).await;
+                return;
+            }
 
-        if self.route_message(&m_id, probe_conn_id, &text, &messages, TaskType::Answer, route_tag.as_deref()).await {
-            return;
+            // Route message with existing tag
+            if self.route_message(&m_id, probe_conn_id, &text, &messages, TaskType::Answer, route_tag.as_deref()).await {
+                return;
+            }
+        } else {
+            // No route: try classify via tagger
+            if self.try_dispatch_classify(&m_id, probe_conn_id, &text, &messages, is_peer).await {
+                return; // Classify dispatched, will continue after result
+            }
+
+            // No tagger available: proceed with route_tag=None
+            if self.route_message(&m_id, probe_conn_id, &text, &messages, TaskType::Answer, None).await {
+                return;
+            }
         }
 
         // No peers available — try to queue
@@ -382,14 +483,21 @@ impl Hub {
     ) -> bool {
         let mut state = self.state.lock().await;
 
-        let mut exclude = state.busy_peers.clone();
+        let mut exclude = state.busy_answerers.clone();
         exclude.insert(probe_conn_id);
         let n_peers = match task_type {
             TaskType::Answer => 3,
             TaskType::Time | TaskType::Archivist => 1,
-            TaskType::Arbiter | TaskType::Benchmark => unreachable!(),
+            TaskType::Arbiter | TaskType::Benchmark | TaskType::Classify => unreachable!(),
         };
-        let selected = router::select_peers(&state.peers, &exclude, n_peers);
+        let selected = router::select_peers(
+            &state.peers,
+            &exclude,
+            &state.busy_answerers,
+            n_peers,
+            crate::state::Capability::Answerer,
+            false,
+        );
 
         if selected.is_empty() {
             return false;
@@ -404,7 +512,7 @@ impl Hub {
             TaskType::Answer => if route_tag == Some("swarm") { 256 } else { 128 },
             TaskType::Time => 64,
             TaskType::Archivist => 60,
-            TaskType::Arbiter | TaskType::Benchmark => unreachable!(),
+            TaskType::Arbiter | TaskType::Benchmark | TaskType::Classify => unreachable!(),
         };
 
         let mut gen_peers = Vec::new();
@@ -412,7 +520,7 @@ impl Hub {
 
         for (conn_id, peer_info) in &selected {
             gen_peers.push(*conn_id);
-            state.busy_peers.insert(*conn_id);
+            state.busy_answerers.insert(*conn_id);
             peers_to_send.push((*conn_id, peer_info.clone()));
         }
 
@@ -433,6 +541,8 @@ impl Hub {
             phase: MessagePhase::Generating,
             task_type,
             route_tag: route_tag.map(|s| s.to_string()),
+            classify_task_id: None,
+            classify_conn_id: None,
         };
         state.messages.insert(m_id.to_string(), pending);
 
@@ -468,7 +578,7 @@ impl Hub {
                 }
                 TaskType::Time => "You are a drone in a distributed swarm of language models. You will be told the current time. Rewrite it naturally in your own words, then add a brief observation. Write it as a single flowing sentence. Do not use JSON. Do not repeat the exact format you were given.".to_string(),
                 TaskType::Archivist => "You are a summarizer. Summarize the question in exactly 5 words. Output ONLY the summary, nothing else.".to_string(),
-                TaskType::Arbiter | TaskType::Benchmark => unreachable!(),
+                TaskType::Arbiter | TaskType::Benchmark | TaskType::Classify => unreachable!(),
             };
             // Truncate messages to fit peer's context window
             let truncated_messages = Self::truncate_messages(messages, &system, max_tokens);
@@ -479,6 +589,7 @@ impl Hub {
                 system,
                 messages: truncated_messages,
                 max_tokens,
+                text: None,
             };
             self.send_to(*conn_id, &task).await;
         }
@@ -494,13 +605,160 @@ impl Hub {
         true
     }
 
+    // ── Classify dispatch ───────────────────────────────────────────
+
+    async fn try_dispatch_classify(
+        self: &Arc<Self>,
+        m_id: &str,
+        probe_conn_id: usize,
+        text: &str,
+        messages: &[crate::protocol::ChatMessage],
+        _is_peer: bool,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+
+        let mut exclude = HashSet::new();
+        exclude.insert(probe_conn_id);
+
+        // Select 1 tagger, prefer tagger-only peers
+        let selected = router::select_peers(
+            &state.peers,
+            &exclude,
+            &state.busy_taggers,
+            1,
+            crate::state::Capability::Tagger,
+            true, // prefer_exclusive
+        );
+
+        if selected.is_empty() {
+            drop(state);
+            let line = hlog::classify_no_tagger();
+            self.emit(&line).await;
+            return false;
+        }
+
+        let (tagger_conn_id, tagger_info) = selected[0].clone();
+        let cls_task_id = m_id.replacen("m_", "cls_", 1);
+
+        // Create PendingMessage with phase=Classifying
+        let pending = PendingMessage {
+            message_id: m_id.to_string(),
+            probe_conn_id,
+            text: text.to_string(),
+            messages: messages.to_vec(),
+            task_id: String::new(), // Will be set when transitioning to Generating
+            gen_peers: Vec::new(),
+            results: Vec::new(),
+            expected_results: 0,
+            arbiter_task_id: None,
+            arbiter_conn_id: None,
+            start: Instant::now(),
+            phase: MessagePhase::Classifying,
+            task_type: TaskType::Answer,
+            route_tag: None,
+            classify_task_id: Some(cls_task_id.clone()),
+            classify_conn_id: Some(tagger_conn_id),
+        };
+
+        state.messages.insert(m_id.to_string(), pending);
+        state.task_to_message.insert(cls_task_id.clone(), m_id.to_string());
+        state.busy_taggers.insert(tagger_conn_id);
+
+        drop(state);
+
+        // Log
+        let line = hlog::classify_assigned(&cls_task_id, &tagger_info.peer_id);
+        self.emit(&line).await;
+
+        // Send classify task
+        let task = HubMsg::Task {
+            task_id: cls_task_id.clone(),
+            message_id: None,
+            task_type: "classify".to_string(),
+            system: String::new(),
+            messages: Vec::new(),
+            max_tokens: 0,
+            text: Some(text.to_string()),
+        };
+        self.send_to(tagger_conn_id, &task).await;
+
+        // Spawn 3s timeout
+        let hub = Arc::clone(self);
+        let m_id_owned = m_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            hub.handle_classify_timeout(&m_id_owned).await;
+        });
+
+        true
+    }
+
+    async fn handle_classify_timeout(self: &Arc<Self>, m_id: &str) {
+        let cls_task_id = {
+            let mut state = self.state.lock().await;
+
+            let message = match state.messages.get_mut(m_id) {
+                Some(msg) if msg.phase == MessagePhase::Classifying => msg,
+                _ => return, // Already handled or moved on
+            };
+
+            // Clear classify tracking
+            let cls_task_id = message.classify_task_id.clone();
+            if let Some(ref task_id) = cls_task_id {
+                state.task_to_message.remove(task_id);
+            }
+            cls_task_id
+        };
+
+        // Log timeout
+        if let Some(ref task_id) = cls_task_id {
+            let line = hlog::classify_timeout(task_id);
+            self.emit(&line).await;
+        }
+
+        // Fallback: proceed with route_tag=None
+        let (probe_conn_id, text, messages) = {
+            let state = self.state.lock().await;
+            let msg = state.messages.get(m_id).unwrap();
+            (msg.probe_conn_id, msg.text.clone(), msg.messages.clone())
+        };
+
+        // Transition to Generating and route
+        if self.route_message(m_id, probe_conn_id, &text, &messages, TaskType::Answer, None).await {
+            return;
+        }
+
+        // Queue or reject
+        let mut state = self.state.lock().await;
+        if state.normal_queue_full() {
+            drop(state);
+            let line = hlog::queue_full(m_id);
+            self.emit(&line).await;
+            let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
+            self.send_to(probe_conn_id, &err).await;
+        } else {
+            state.normal_queue.push_back(QueuedMessage {
+                message_id: m_id.to_string(),
+                probe_conn_id,
+                text,
+                messages,
+                task_type: TaskType::Answer,
+                route_tag: None,
+                arbitration_for: None,
+            });
+        }
+    }
+
     // ── Queue dispatch ──────────────────────────────────────────────
 
     async fn try_dispatch_queue(self: &Arc<Self>) {
         loop {
             let queued = {
                 let mut state = self.state.lock().await;
-                let has_idle = state.peers.keys().any(|id| !state.busy_peers.contains(id));
+                let has_idle = state.peers.iter().any(|(id, peer)| {
+                    !state.busy_answerers.contains(id)
+                        && peer.capabilities.contains(&crate::state::Capability::Answerer)
+                });
                 if !has_idle {
                     break;
                 }
@@ -535,7 +793,7 @@ impl Hub {
                     match queued.task_type {
                         TaskType::Answer | TaskType::Arbiter => state.normal_queue.push_front(queued),
                         TaskType::Time | TaskType::Archivist => state.low_queue.push_front(queued),
-                        TaskType::Benchmark => unreachable!(),
+                        TaskType::Benchmark | TaskType::Classify => unreachable!(),
                     }
                     break;
                 }
@@ -567,14 +825,20 @@ impl Hub {
         tokens: u32,
         inference_ms: u64,
     ) {
-        // 1. Get peer info, unmark busy, look up message. Handle benchmarks inline.
-        let (peer_id, message_id, is_benchmark) = {
+        // 1. Get peer info, unmark busy, look up message. Handle benchmarks and classify inline.
+        let (peer_id, message_id, is_benchmark, is_classify) = {
             let mut state = self.state.lock().await;
             let peer_id = state.peers.get(&conn_id)
                 .map(|p| p.peer_id.clone())
                 .unwrap_or_else(|| format!("conn_{conn_id}"));
             let message_id = state.task_to_message.get(&task_id).cloned();
-            state.busy_peers.remove(&conn_id);
+
+            let is_classify = task_id.starts_with("cls_");
+            if is_classify {
+                state.busy_taggers.remove(&conn_id);
+            } else {
+                state.busy_answerers.remove(&conn_id);
+            }
 
             let is_benchmark = message_id.as_ref()
                 .and_then(|qid| state.messages.get(qid))
@@ -591,12 +855,116 @@ impl Hub {
                 }
             }
 
-            (peer_id, message_id, is_benchmark)
+            (peer_id, message_id, is_benchmark, is_classify)
         };
 
         if is_benchmark {
             let line = hlog::peer_ready(&peer_id, tok_s);
             self.emit(&line).await;
+            return;
+        }
+
+        // Handle classify result
+        if is_classify {
+            let message_id = match message_id {
+                Some(id) => id,
+                None => return,
+            };
+
+            // Parse JSON result: {label, score, scores}
+            let (route_label, score, parse_error) = match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(json) => {
+                    let label = json.get("label").and_then(|v| v.as_str()).unwrap_or("other");
+                    let score = json.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    (label.to_string(), score, None)
+                }
+                Err(e) => {
+                    // Parse failure → fallback to unrouted
+                    ("other".to_string(), 0.0, Some(e.to_string()))
+                }
+            };
+
+            // Log parse failure if it occurred
+            if let Some(err) = parse_error {
+                let line = format!("{} [classify {}] JSON parse failed: {}, defaulting to other", hlog::ts(), task_id, err);
+                self.emit(&line).await;
+            }
+
+            // Apply threshold and extract route_tag
+            let route_tag = if score < 0.6 {
+                None
+            } else {
+                match route_label.as_str() {
+                    "swarm" => Some("swarm".to_string()),
+                    "time" => Some("time".to_string()),
+                    "weather" => Some("weather".to_string()),
+                    _ => None,
+                }
+            };
+
+            // Log classify completion
+            let line = hlog::classify_completed(&task_id, &peer_id, &route_label, score, inference_ms, route_tag.is_some());
+            self.emit(&line).await;
+
+            // Get message details for observer gating and routing
+            let (probe_conn_id, text, messages, is_peer) = {
+                let state = self.state.lock().await;
+                let msg = state.messages.get(&message_id);
+                match msg {
+                    Some(m) if m.phase == MessagePhase::Classifying => {
+                        let is_peer = state.peers.contains_key(&m.probe_conn_id);
+                        (m.probe_conn_id, m.text.clone(), m.messages.clone(), is_peer)
+                    }
+                    _ => return, // Message already moved on or done
+                }
+            };
+
+            // Observer gating: reject swarm-tagged messages from non-peers
+            if route_tag.as_deref() == Some("swarm") && !is_peer {
+                let line = format!("{} [error] {} attempted swarm message without joining", hlog::ts(), message_id);
+                self.emit(&line).await;
+                let err = HubMsg::Error { text: "Join the swarm to know the swarm.".to_string() };
+                self.send_to(probe_conn_id, &err).await;
+
+                // Mark message as done and clean up
+                let mut state = self.state.lock().await;
+                if let Some(msg) = state.messages.get_mut(&message_id) {
+                    msg.phase = MessagePhase::Done;
+                }
+                state.task_to_message.remove(&task_id);
+                return;
+            }
+
+            // Clean up classify task tracking
+            {
+                let mut state = self.state.lock().await;
+                state.task_to_message.remove(&task_id);
+            }
+
+            // Transition to Generating and route
+            if self.route_message(&message_id, probe_conn_id, &text, &messages, TaskType::Answer, route_tag.as_deref()).await {
+                return;
+            }
+
+            // Queue or reject
+            let mut state = self.state.lock().await;
+            if state.normal_queue_full() {
+                drop(state);
+                let line = hlog::queue_full(&message_id);
+                self.emit(&line).await;
+                let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
+                self.send_to(probe_conn_id, &err).await;
+            } else {
+                state.normal_queue.push_back(QueuedMessage {
+                    message_id: message_id.clone(),
+                    probe_conn_id,
+                    text,
+                    messages,
+                    task_type: TaskType::Answer,
+                    route_tag,
+                    arbitration_for: None,
+                });
+            }
             return;
         }
 
@@ -777,13 +1145,20 @@ impl Hub {
         let probe = message.probe_conn_id;
 
         // Build exclude set: generation peers + busy peers + probe
-        let mut exclude = state.busy_peers.clone();
+        let mut exclude = state.busy_answerers.clone();
         for &conn_id in &gen_conn_ids {
             exclude.insert(conn_id);
         }
         exclude.insert(probe);
 
-        let arbiters = router::select_peers(&state.peers, &exclude, 1);
+        let arbiters = router::select_peers(
+            &state.peers,
+            &exclude,
+            &state.busy_answerers,
+            1,
+            crate::state::Capability::Answerer,
+            false,
+        );
 
         if let Some((arbiter_conn_id, arbiter_info)) = arbiters.into_iter().next() {
             let arbiter_task_id = message_id.replacen("m_", "arb_", 1);
@@ -812,7 +1187,7 @@ impl Hub {
             message.phase = MessagePhase::Arbitrating;
 
             state.task_to_message.insert(arbiter_task_id.clone(), message_id.to_string());
-            state.busy_peers.insert(arbiter_conn_id);
+            state.busy_answerers.insert(arbiter_conn_id);
             drop(state);
 
             let line = hlog::arbiter_assigned(
@@ -827,6 +1202,7 @@ impl Hub {
                 system: arbiter_system,
                 messages: truncated_arbiter_messages,
                 max_tokens: 8,
+                text: None,
             };
             self.send_to(arbiter_conn_id, &task).await;
             true
@@ -943,6 +1319,9 @@ impl Hub {
                     peers_used,
                 };
                 self.send_to(probe, &response).await;
+            }
+            MessagePhase::Classifying => {
+                // Classify timeout handling added in Task #4
             }
             MessagePhase::Done => {}
         }

@@ -16,6 +16,8 @@ pub enum ClientMsg {
         model_size: String,
         #[serde(default)]
         tok_s: Option<f64>,
+        #[serde(default)]
+        capabilities: Option<Vec<String>>,
     },
     Result {
         task_id: String,
@@ -54,6 +56,8 @@ pub enum HubMsg {
         system: String,
         messages: Vec<ChatMessage>,
         max_tokens: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     Log {
         line: String,
