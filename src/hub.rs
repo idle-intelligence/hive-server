@@ -471,7 +471,14 @@ impl Hub {
             TaskType::Time | TaskType::Archivist => 1,
             TaskType::Arbiter | TaskType::Benchmark | TaskType::Classify => unreachable!(),
         };
-        let selected = router::select_peers(&state.peers, &exclude, n_peers);
+        let selected = router::select_peers(
+            &state.peers,
+            &exclude,
+            &state.busy_answerers,
+            n_peers,
+            crate::state::Capability::Answerer,
+            false,
+        );
 
         if selected.is_empty() {
             return false;
@@ -711,7 +718,10 @@ impl Hub {
         loop {
             let queued = {
                 let mut state = self.state.lock().await;
-                let has_idle = state.peers.keys().any(|id| !state.busy_answerers.contains(id));
+                let has_idle = state.peers.iter().any(|(id, peer)| {
+                    !state.busy_answerers.contains(id)
+                        && peer.capabilities.contains(&crate::state::Capability::Answerer)
+                });
                 if !has_idle {
                     break;
                 }
@@ -1079,7 +1089,14 @@ impl Hub {
         }
         exclude.insert(probe);
 
-        let arbiters = router::select_peers(&state.peers, &exclude, 1);
+        let arbiters = router::select_peers(
+            &state.peers,
+            &exclude,
+            &state.busy_answerers,
+            1,
+            crate::state::Capability::Answerer,
+            false,
+        );
 
         if let Some((arbiter_conn_id, arbiter_info)) = arbiters.into_iter().next() {
             let arbiter_task_id = message_id.replacen("m_", "arb_", 1);

@@ -116,24 +116,46 @@ pub fn swarm_status(peer_count: usize) -> String {
 }
 
 pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: usize, messages_today: u64, total_flops: f64) -> (String, Option<String>) {
+    use crate::state::Capability;
+
     let total = peers.len();
+    let mut answerer_count = 0;
+    let mut tagger_only_count = 0;
     let mut total_tok_s = 0.0;
-    let mut size_counts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    let mut answerer_size_counts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
 
     for peer in peers.values() {
-        total_tok_s += peer.tok_s;
-        *size_counts.entry(&peer.model_size).or_insert(0) += 1;
+        let has_answerer = peer.capabilities.contains(&Capability::Answerer);
+        let has_tagger = peer.capabilities.contains(&Capability::Tagger);
+
+        if has_answerer {
+            answerer_count += 1;
+            total_tok_s += peer.tok_s;
+            *answerer_size_counts.entry(&peer.model_size).or_insert(0) += 1;
+        } else if has_tagger {
+            tagger_only_count += 1;
+        }
     }
 
-    let sizes = size_counts.iter()
-        .map(|(size, count)| format!("{count} {size}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let peer_line = format!(
-        "{} [swarm] {} Peer: {} | {:.1} tok/s | {} Message | {:.2e} total FLOPS",
-        ts(), total, sizes, total_tok_s, messages_today, total_flops
-    );
+    let peer_line = if tagger_only_count > 0 {
+        let sizes = answerer_size_counts.iter()
+            .map(|(size, count)| format!("{count} {size}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{} [swarm] {} Peer: {} answerer ({}, {:.1} tok/s) + {} tagger | {} Message | {:.2e} total FLOPS",
+            ts(), total, answerer_count, sizes, total_tok_s, tagger_only_count, messages_today, total_flops
+        )
+    } else {
+        let sizes = answerer_size_counts.iter()
+            .map(|(size, count)| format!("{count} {size}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{} [swarm] {} Peer: {} | {:.1} tok/s | {} Message | {:.2e} total FLOPS",
+            ts(), total, sizes, total_tok_s, messages_today, total_flops
+        )
+    };
 
     let clients = probes + observers;
     let client_line = if clients > 0 {
