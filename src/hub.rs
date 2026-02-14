@@ -156,7 +156,26 @@ impl Hub {
             if self.route_message(&m_id, probe_conn_id, &text, &messages, TaskType::Answer, None).await {
                 continue;
             }
-            // If routing fails, message will be queued or rejected by existing logic
+
+            // Queue or reject
+            let mut state = self.state.lock().await;
+            if state.normal_queue_full() {
+                drop(state);
+                let line = hlog::queue_full(&m_id);
+                self.emit(&line).await;
+                let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
+                self.send_to(probe_conn_id, &err).await;
+            } else {
+                state.normal_queue.push_back(QueuedMessage {
+                    message_id: m_id.clone(),
+                    probe_conn_id,
+                    text,
+                    messages,
+                    task_type: TaskType::Answer,
+                    route_tag: None,
+                    arbitration_for: None,
+                });
+            }
         }
 
         if let Some(peer) = removed {
@@ -709,7 +728,25 @@ impl Hub {
             return;
         }
 
-        // Queue or reject (existing fallback logic will be called from process_incoming_message)
+        // Queue or reject
+        let mut state = self.state.lock().await;
+        if state.normal_queue_full() {
+            drop(state);
+            let line = hlog::queue_full(m_id);
+            self.emit(&line).await;
+            let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
+            self.send_to(probe_conn_id, &err).await;
+        } else {
+            state.normal_queue.push_back(QueuedMessage {
+                message_id: m_id.to_string(),
+                probe_conn_id,
+                text,
+                messages,
+                task_type: TaskType::Answer,
+                route_tag: None,
+                arbitration_for: None,
+            });
+        }
     }
 
     // ── Queue dispatch ──────────────────────────────────────────────
@@ -795,11 +832,12 @@ impl Hub {
                 .map(|p| p.peer_id.clone())
                 .unwrap_or_else(|| format!("conn_{conn_id}"));
             let message_id = state.task_to_message.get(&task_id).cloned();
-            state.busy_answerers.remove(&conn_id);
 
             let is_classify = task_id.starts_with("cls_");
             if is_classify {
                 state.busy_taggers.remove(&conn_id);
+            } else {
+                state.busy_answerers.remove(&conn_id);
             }
 
             let is_benchmark = message_id.as_ref()
@@ -834,17 +872,23 @@ impl Hub {
             };
 
             // Parse JSON result: {label, score, scores}
-            let (route_label, score) = match serde_json::from_str::<serde_json::Value>(&text) {
+            let (route_label, score, parse_error) = match serde_json::from_str::<serde_json::Value>(&text) {
                 Ok(json) => {
                     let label = json.get("label").and_then(|v| v.as_str()).unwrap_or("other");
                     let score = json.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    (label.to_string(), score)
+                    (label.to_string(), score, None)
                 }
-                Err(_) => {
+                Err(e) => {
                     // Parse failure → fallback to unrouted
-                    ("other".to_string(), 0.0)
+                    ("other".to_string(), 0.0, Some(e.to_string()))
                 }
             };
+
+            // Log parse failure if it occurred
+            if let Some(err) = parse_error {
+                let line = format!("{} [classify {}] JSON parse failed: {}, defaulting to other", hlog::ts(), task_id, err);
+                self.emit(&line).await;
+            }
 
             // Apply threshold and extract route_tag
             let route_tag = if score < 0.6 {
@@ -902,7 +946,25 @@ impl Hub {
                 return;
             }
 
-            // Routing failed — message will be queued or rejected by existing logic
+            // Queue or reject
+            let mut state = self.state.lock().await;
+            if state.normal_queue_full() {
+                drop(state);
+                let line = hlog::queue_full(&message_id);
+                self.emit(&line).await;
+                let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
+                self.send_to(probe_conn_id, &err).await;
+            } else {
+                state.normal_queue.push_back(QueuedMessage {
+                    message_id: message_id.clone(),
+                    probe_conn_id,
+                    text,
+                    messages,
+                    task_type: TaskType::Answer,
+                    route_tag,
+                    arbitration_for: None,
+                });
+            }
             return;
         }
 
