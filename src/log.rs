@@ -95,6 +95,22 @@ pub fn archivist_failed(task_id: &str, reason: &str) -> String {
     format!("{} [archivist {}] failed ({})", ts(), task_id, reason)
 }
 
+pub fn classify_assigned(task_id: &str, peer_id: &str) -> String {
+    format!("{} [classify {}] assigned to {}", ts(), task_id, peer_id)
+}
+
+pub fn classify_completed(task_id: &str, peer_id: &str, route: &str, score: f64, ms: u64) -> String {
+    format!("{} [classify {}] {} → \"{}\" ({:.2}, {}ms)", ts(), task_id, peer_id, route, score, ms)
+}
+
+pub fn classify_timeout(task_id: &str) -> String {
+    format!("{} [classify {}] timed out, proceeding unrouted", ts(), task_id)
+}
+
+pub fn classify_no_tagger() -> String {
+    format!("{} [classify] no tagger available, proceeding unrouted", ts())
+}
+
 pub fn swarm_status(peer_count: usize) -> String {
     format!("{} [swarm] {} Peer connected", ts(), peer_count)
 }
