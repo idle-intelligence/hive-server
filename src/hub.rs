@@ -136,16 +136,17 @@ impl Hub {
 
         // Handle classify disconnect: find messages stuck in Classifying phase with this peer
         let classify_fallback_messages: Vec<(String, usize, String, Vec<crate::protocol::ChatMessage>)> = {
-            let state = self.state.lock().await;
-            state.messages.iter()
-                .filter(|(_, msg)| {
-                    msg.phase == MessagePhase::Classifying
-                        && msg.classify_conn_id == Some(conn_id)
-                })
-                .map(|(m_id, msg)| {
-                    (m_id.clone(), msg.probe_conn_id, msg.text.clone(), msg.messages.clone())
-                })
-                .collect()
+            let mut state = self.state.lock().await;
+            let mut fallbacks = Vec::new();
+            for (m_id, msg) in state.messages.iter_mut() {
+                if msg.phase == MessagePhase::Classifying
+                    && msg.classify_conn_id == Some(conn_id)
+                {
+                    msg.phase = MessagePhase::Generating;  // Prevent timeout race
+                    fallbacks.push((m_id.clone(), msg.probe_conn_id, msg.text.clone(), msg.messages.clone()));
+                }
+            }
+            fallbacks
         };
 
         for (m_id, probe_conn_id, text, messages) in classify_fallback_messages {
@@ -694,7 +695,7 @@ impl Hub {
     }
 
     async fn handle_classify_timeout(self: &Arc<Self>, m_id: &str) {
-        let cls_task_id = {
+        let (cls_task_id, probe_conn_id, text, messages) = {
             let mut state = self.state.lock().await;
 
             let message = match state.messages.get_mut(m_id) {
@@ -702,12 +703,19 @@ impl Hub {
                 _ => return, // Already handled or moved on
             };
 
-            // Clear classify tracking
+            message.phase = MessagePhase::Generating;  // Prevent re-entry
+
+            // Extract all data before releasing the mutable borrow on message
             let cls_task_id = message.classify_task_id.clone();
+            let probe_conn_id = message.probe_conn_id;
+            let text = message.text.clone();
+            let messages = message.messages.clone();
+
+            // Clear classify tracking (now safe — message borrow is done)
             if let Some(ref task_id) = cls_task_id {
                 state.task_to_message.remove(task_id);
             }
-            cls_task_id
+            (cls_task_id, probe_conn_id, text, messages)
         };
 
         // Log timeout
@@ -715,13 +723,6 @@ impl Hub {
             let line = hlog::classify_timeout(task_id);
             self.emit(&line).await;
         }
-
-        // Fallback: proceed with route_tag=None
-        let (probe_conn_id, text, messages) = {
-            let state = self.state.lock().await;
-            let msg = state.messages.get(m_id).unwrap();
-            (msg.probe_conn_id, msg.text.clone(), msg.messages.clone())
-        };
 
         // Transition to Generating and route
         if self.route_message(m_id, probe_conn_id, &text, &messages, TaskType::Answer, None).await {
@@ -908,15 +909,18 @@ impl Hub {
 
             // Get message details for observer gating and routing
             let (probe_conn_id, text, messages, is_peer) = {
-                let state = self.state.lock().await;
-                let msg = state.messages.get(&message_id);
-                match msg {
-                    Some(m) if m.phase == MessagePhase::Classifying => {
-                        let is_peer = state.peers.contains_key(&m.probe_conn_id);
-                        (m.probe_conn_id, m.text.clone(), m.messages.clone(), is_peer)
-                    }
+                let mut state = self.state.lock().await;
+                let msg = match state.messages.get_mut(&message_id) {
+                    Some(m) if m.phase == MessagePhase::Classifying => m,
                     _ => return, // Message already moved on or done
-                }
+                };
+                msg.phase = MessagePhase::Generating;
+                msg.route_tag = route_tag.clone();
+                let probe_conn_id = msg.probe_conn_id;
+                let text = msg.text.clone();
+                let messages = msg.messages.clone();
+                let is_peer = state.peers.contains_key(&probe_conn_id);
+                (probe_conn_id, text, messages, is_peer)
             };
 
             // Observer gating: reject swarm-tagged messages from non-peers
