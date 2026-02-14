@@ -103,7 +103,7 @@ pub fn classify_completed(task_id: &str, peer_id: &str, route: &str, score: f64,
     if routed {
         format!("{} [classify {}] {} → \"{}\" ({:.2}, {}ms)", ts(), task_id, peer_id, route, score, ms)
     } else {
-        format!("{} [classify {}] {} → \"{}\" ({:.2}, {}ms) below threshold, unrouted", ts(), task_id, peer_id, route, score, ms)
+        format!("{} [classify {}] {} → \"{}\" ({:.2}, {}ms) below threshold, other", ts(), task_id, peer_id, route, score, ms)
     }
 }
 
