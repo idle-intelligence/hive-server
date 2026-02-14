@@ -619,7 +619,7 @@ impl Hub {
         }
 
         let (tagger_conn_id, tagger_info) = selected[0].clone();
-        let cls_task_id = format!("cls_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let cls_task_id = m_id.replacen("m_", "cls_", 1);
 
         // Create PendingMessage with phase=Classifying
         let pending = PendingMessage {
