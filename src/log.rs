@@ -44,13 +44,8 @@ pub fn task_completed(task_id: &str, peer_id: &str, tokens: u32, inference_ms: u
     )
 }
 
-pub fn message_received(m_id: &str, text: &str, route: Option<&str>, classifier_score: Option<f64>, classifier_ms: Option<u64>) -> String {
-    let base = format!("{} [message {}] received: \"{}\"", ts(), m_id, text);
-    match (route, classifier_score, classifier_ms) {
-        (Some(r), Some(score), Some(ms)) => format!("{base} (route:{r}, classifier: {score:.2} score, {ms}ms)"),
-        (Some(r), _, _) => format!("{base} (route:{r})"),
-        _ => base,
-    }
+pub fn message_received(m_id: &str, text: &str) -> String {
+    format!("{} [message {}] received: \"{}\"", ts(), m_id, text)
 }
 
 pub fn arbiter_assigned(arbiter_id: &str, peer_id: &str, model: &str, model_size: &str) -> String {
