@@ -490,7 +490,7 @@ impl Hub {
             }
         } else {
             // No route: try classify via tagger
-            if self.try_dispatch_classify(&m_id, probe_conn_id, &text, &messages, is_peer).await {
+            if self.try_dispatch_classify(&m_id, probe_conn_id, &text, &messages).await {
                 return; // Classify dispatched, will continue after result
             }
 
@@ -664,7 +664,6 @@ impl Hub {
         probe_conn_id: usize,
         text: &str,
         messages: &[crate::protocol::ChatMessage],
-        _is_peer: bool,
     ) -> bool {
         let mut state = self.state.lock().await;
 

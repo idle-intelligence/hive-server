@@ -35,11 +35,17 @@ pub enum ClientMsg {
         text: Option<String>,
         #[serde(default)]
         messages: Option<Vec<ChatMessage>>,
+        // Accepted from old clients, ignored since drones-are-drones refactor
         #[serde(default)]
+        #[allow(dead_code)]
         route: Option<String>,
+        // Accepted from old clients, ignored since drones-are-drones refactor
         #[serde(default)]
+        #[allow(dead_code)]
         classifier_ms: Option<u64>,
+        // Accepted from old clients, ignored since drones-are-drones refactor
         #[serde(default)]
+        #[allow(dead_code)]
         classifier_score: Option<f64>,
     },
 }
