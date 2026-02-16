@@ -349,7 +349,7 @@ impl Hub {
                 self.state.lock().await.update_load(conn_id, load);
             }
 
-            ClientMsg::Message { text, messages, route, classifier_ms, classifier_score } => {
+            ClientMsg::Message { text, messages, route: _, classifier_ms: _, classifier_score: _ } => {
                 let messages = messages.unwrap_or_else(|| {
                     vec![ChatMessage {
                         role: "user".to_string(),
@@ -367,13 +367,7 @@ impl Hub {
                     return;
                 }
 
-                let route_tag = match route.as_deref() {
-                    Some("swarm") => Some("swarm".to_string()),
-                    Some("time") => Some("time".to_string()),
-                    Some("weather") => Some("weather".to_string()),
-                    _ => None,
-                };
-                self.process_incoming_message(conn_id, display_text, messages, route_tag, classifier_score, classifier_ms).await;
+                self.process_incoming_message(conn_id, display_text, messages).await;
             }
         }
     }
@@ -430,10 +424,10 @@ impl Hub {
 
     // ── Question routing ────────────────────────────────────────────
 
-    async fn process_incoming_message(self: &Arc<Self>, probe_conn_id: usize, text: String, messages: Vec<crate::protocol::ChatMessage>, route_tag: Option<String>, classifier_score: Option<f64>, classifier_ms: Option<u64>) {
+    async fn process_incoming_message(self: &Arc<Self>, probe_conn_id: usize, text: String, messages: Vec<crate::protocol::ChatMessage>) {
         let m_id = format!("m_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
-        let line = hlog::message_received(&m_id, &text, route_tag.as_deref(), classifier_score, classifier_ms);
+        let line = hlog::message_received(&m_id, &text);
         self.emit(&line).await;
 
         let is_peer = {
@@ -446,58 +440,14 @@ impl Hub {
             is_peer
         };
 
-        // Check if route is already present (local classification)
-        if route_tag.is_some() {
-            // Observer gating: reject swarm-tagged messages from non-peers
-            if route_tag.as_deref() == Some("swarm") && !is_peer {
-                let line = format!("{} [error] {} attempted swarm message without joining", hlog::ts(), m_id);
-                self.emit(&line).await;
-                let err = HubMsg::Error { text: "Join the swarm to know the swarm.".to_string() };
-                self.send_to(probe_conn_id, &err).await;
-                return;
-            }
+        // All messages go through swarm classification
+        if self.try_dispatch_classify(&m_id, probe_conn_id, &text, &messages, is_peer).await {
+            return; // Classify dispatched, will continue after result
+        }
 
-            // Time route: 1 peer, no arbiter, inject current UTC time
-            if route_tag.as_deref() == Some("time") {
-                let time_messages = build_time_query_messages(&text);
-                if self.route_message(&m_id, probe_conn_id, &text, &time_messages, TaskType::Time, route_tag.as_deref()).await {
-                    return;
-                }
-                let mut state = self.state.lock().await;
-                if state.normal_queue_full() {
-                    drop(state);
-                    let line = hlog::queue_full(&m_id);
-                    self.emit(&line).await;
-                    let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
-                    self.send_to(probe_conn_id, &err).await;
-                } else {
-                    state.normal_queue.push_back(QueuedMessage {
-                        message_id: m_id.clone(),
-                        probe_conn_id,
-                        text: text.clone(),
-                        messages: time_messages,
-                        task_type: TaskType::Time,
-                        route_tag,
-                        arbitration_for: None,
-                    });
-                }
-                return;
-            }
-
-            // Route message with existing tag
-            if self.route_message(&m_id, probe_conn_id, &text, &messages, TaskType::Answer, route_tag.as_deref()).await {
-                return;
-            }
-        } else {
-            // No route: try classify via tagger
-            if self.try_dispatch_classify(&m_id, probe_conn_id, &text, &messages, is_peer).await {
-                return; // Classify dispatched, will continue after result
-            }
-
-            // No tagger available: proceed with route_tag=None
-            if self.route_message(&m_id, probe_conn_id, &text, &messages, TaskType::Answer, None).await {
-                return;
-            }
+        // No tagger available: proceed with route_tag=None (default Answer flow)
+        if self.route_message(&m_id, probe_conn_id, &text, &messages, TaskType::Answer, None).await {
+            return;
         }
 
         // No peers available — try to queue
@@ -516,7 +466,7 @@ impl Hub {
             text: text.clone(),
             messages: messages.clone(),
             task_type: TaskType::Answer,
-            route_tag,
+            route_tag: None,
             arbitration_for: None,
         });
         drop(state);
