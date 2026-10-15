@@ -114,6 +114,12 @@ struct Conn {
     writer: tokio::task::AbortHandle,
 }
 
+/// How long a generation or arbiter task may take before the hub answers without it.
+#[cfg(not(test))]
+const TASK_TIMEOUT: Duration = Duration::from_secs(12);
+#[cfg(test)]
+const TASK_TIMEOUT: Duration = Duration::from_millis(600);
+
 static NEXT_CONN_ID: AtomicUsize = AtomicUsize::new(1);
 
 pub struct Hub {
@@ -733,15 +739,21 @@ impl Hub {
             self.send_to(*conn_id, &task).await;
         }
 
-        // Spawn 12s timeout
-        let hub = Arc::clone(self);
-        let m_id_owned = m_id.to_string();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(12)).await;
-            hub.handle_timeout(&m_id_owned).await;
-        });
+        self.start_timeout(m_id);
 
         true
+    }
+
+    /// Calls `handle_timeout` for the message after `TASK_TIMEOUT`. A plain function, so
+    /// that the futures of `try_assign_arbiter` and `handle_timeout`, which call each
+    /// other, do not have to prove themselves `Send` through the spawn.
+    fn start_timeout(self: &Arc<Self>, message_id: &str) {
+        let hub = Arc::clone(self);
+        let message_id = message_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(TASK_TIMEOUT).await;
+            hub.handle_timeout(&message_id).await;
+        });
     }
 
     // ── Classify dispatch ───────────────────────────────────────────
@@ -1477,6 +1489,8 @@ impl Hub {
                 text: None,
             };
             self.send_to(arbiter_conn_id, &task).await;
+
+            self.start_timeout(message_id);
             true
         } else {
             false
@@ -2207,5 +2221,46 @@ mod tests {
             .unwrap();
         assert_eq!(message.results.len(), 1);
         assert_eq!(message.phase, MessagePhase::Generating);
+    }
+    #[tokio::test]
+    async fn the_asker_gets_an_answer_when_the_arbiter_given_after_the_timeout_never_replies() {
+        let (hub, addr) = hub_serving().await;
+        let drones = [
+            Drone::join(&hub, addr, "d1").await,
+            Drone::join(&hub, addr, "d2").await,
+            Drone::join(&hub, addr, "d3").await,
+            Drone::join(&hub, addr, "d4").await,
+        ];
+        let mut asker = connect(addr).await;
+        send_json(&mut asker, ask("hi")).await;
+        let mut assigned = Vec::new();
+        for _ in 0..200 {
+            assigned = drones
+                .iter()
+                .filter(|d| {
+                    d.tasks
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t["task_type"] == "answer")
+                })
+                .collect();
+            if assigned.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(assigned.len(), 3);
+        for d in &assigned[..2] {
+            d.answer(&d.task("answer").await, "an answer");
+        }
+        // The third drone is silent. The timeout gives the arbiter job to the fourth, which is silent too.
+        let spare = drones
+            .iter()
+            .find(|d| !assigned.iter().any(|a| std::ptr::eq(*a, *d)))
+            .unwrap();
+        spare.task("arbiter").await;
+        let response = next_of_type(&mut asker, "response", 4000).await;
+        assert_eq!(response.unwrap()["text"], "an answer");
     }
 }
