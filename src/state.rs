@@ -79,6 +79,20 @@ pub struct PendingMessage {
     pub classify_conn_id: Option<usize>,
 }
 
+impl PendingMessage {
+    /// True if `task_id` of this message was given to connection `conn_id` and that
+    /// connection has not answered it yet.
+    pub fn expects_result_from(&self, task_id: &str, conn_id: usize) -> bool {
+        if self.classify_task_id.as_deref() == Some(task_id) {
+            self.classify_conn_id == Some(conn_id)
+        } else if self.arbiter_task_id.as_deref() == Some(task_id) {
+            self.arbiter_conn_id == Some(conn_id)
+        } else {
+            self.gen_peers.contains(&conn_id) && !self.results.iter().any(|r| r.conn_id == conn_id)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct QueuedMessage {
     pub message_id: String,

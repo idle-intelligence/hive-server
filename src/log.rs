@@ -68,6 +68,15 @@ pub fn task_completed(
     )
 }
 
+pub fn result_ignored(task_id: &str, peer_id: &str) -> String {
+    format!(
+        "{} [task {}] ignored a result from {} (not expected from it)",
+        ts(),
+        task_id,
+        peer_id
+    )
+}
+
 pub fn message_received(m_id: &str, text: &str) -> String {
     format!(
         "{} [message {}] received ({} chars)",

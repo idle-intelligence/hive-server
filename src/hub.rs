@@ -997,8 +997,9 @@ impl Hub {
             text = text.chars().take(2000).collect();
         }
 
-        // 1. Get peer info, unmark busy, look up message. Handle benchmarks and classify inline.
-        let (peer_id, message_id, is_benchmark, is_classify) = {
+        // 1. Check the task was given to this connection, get peer info, unmark busy, look up
+        // message. Handle benchmarks and classify inline.
+        let checked = {
             let mut state = self.state.lock().await;
             let peer_id = state
                 .peers
@@ -1007,30 +1008,46 @@ impl Hub {
                 .unwrap_or_else(|| format!("conn_{conn_id}"));
             let message_id = state.task_to_message.get(&task_id).cloned();
 
-            let is_classify = task_id.starts_with("cls_");
-            if is_classify {
-                state.busy_taggers.remove(&conn_id);
-            } else {
-                state.busy_answerers.remove(&conn_id);
-            }
-
-            let is_benchmark = message_id
+            let expected = message_id
                 .as_ref()
                 .and_then(|qid| state.messages.get(qid))
-                .map(|q| q.task_type == TaskType::Benchmark)
-                .unwrap_or(false);
+                .is_some_and(|q| q.expects_result_from(&task_id, conn_id));
+            if !expected {
+                Err(peer_id)
+            } else {
+                let is_classify = task_id.starts_with("cls_");
+                if is_classify {
+                    state.busy_taggers.remove(&conn_id);
+                } else {
+                    state.busy_answerers.remove(&conn_id);
+                }
 
-            if is_benchmark {
-                if let Some(peer) = state.peers.get_mut(&conn_id) {
-                    peer.tok_s = tok_s;
+                let is_benchmark = message_id
+                    .as_ref()
+                    .and_then(|qid| state.messages.get(qid))
+                    .map(|q| q.task_type == TaskType::Benchmark)
+                    .unwrap_or(false);
+
+                if is_benchmark {
+                    if let Some(peer) = state.peers.get_mut(&conn_id) {
+                        peer.tok_s = tok_s;
+                    }
+                    if let Some(ref qid) = message_id {
+                        state.messages.remove(qid);
+                        state.task_to_message.remove(&task_id);
+                    }
                 }
-                if let Some(ref qid) = message_id {
-                    state.messages.remove(qid);
-                    state.task_to_message.remove(&task_id);
-                }
+
+                Ok((peer_id, message_id, is_benchmark, is_classify))
             }
-
-            (peer_id, message_id, is_benchmark, is_classify)
+        };
+        let (peer_id, message_id, is_benchmark, is_classify) = match checked {
+            Ok(found) => found,
+            Err(peer_id) => {
+                let line = hlog::result_ignored(&task_id, &peer_id);
+                self.emit(&line).await;
+                return;
+            }
         };
 
         if is_benchmark {
@@ -2021,5 +2038,174 @@ mod tests {
         let senders = hub.senders.lock().unwrap();
         assert_eq!(senders.len(), 1);
         assert!(!senders.contains_key(&stuck_id));
+    }
+    type Ws = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn connect(addr: std::net::SocketAddr) -> Ws {
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        ws
+    }
+
+    async fn send_json(ws: &mut Ws, value: serde_json::Value) {
+        ws.send(Message::Text(value.to_string())).await.unwrap();
+    }
+
+    /// Reads until a message of type `ty` arrives. None after `ms` milliseconds.
+    async fn next_of_type(ws: &mut Ws, ty: &str, ms: u64) -> Option<serde_json::Value> {
+        tokio::time::timeout(Duration::from_millis(ms), async {
+            loop {
+                let Message::Text(text) = ws.next().await?.ok()? else {
+                    continue;
+                };
+                let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if json["type"] == ty {
+                    return Some(json);
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn wait_state(hub: &Arc<Hub>, what: &str, cond: impl Fn(&HubState) -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !cond(&*hub.state.lock().await) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    /// A fake drone. It answers its own benchmark and records every other task; the test
+    /// decides what it sends back.
+    struct Drone {
+        tasks: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        out: mpsc::UnboundedSender<serde_json::Value>,
+    }
+
+    impl Drone {
+        async fn join(hub: &Arc<Hub>, addr: std::net::SocketAddr, peer_id: &str) -> Drone {
+            let mut ws = connect(addr).await;
+            send_json(
+                &mut ws,
+                serde_json::json!({"type":"register","peer_id":peer_id,"model":"m","model_size":"1B","tok_s":10.0,"capabilities":["answerer"]}),
+            )
+            .await;
+            let tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (out, mut outbox) = mpsc::unbounded_channel::<serde_json::Value>();
+            let seen = Arc::clone(&tasks);
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        incoming = ws.next() => {
+                            let Some(Ok(Message::Text(text))) = incoming else { continue };
+                            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            if json["type"] != "task" {
+                                continue;
+                            }
+                            if json["task_type"] == "benchmark" {
+                                let reply = serde_json::json!({"type":"result","task_id":json["task_id"],"text":"3","tok_s":10.0,"tokens":1,"inference_ms":1});
+                                ws.send(Message::Text(reply.to_string())).await.unwrap();
+                            } else {
+                                seen.lock().unwrap().push(json);
+                            }
+                        }
+                        Some(msg) = outbox.recv() => {
+                            ws.send(Message::Text(msg.to_string())).await.unwrap();
+                        }
+                    }
+                }
+            });
+            let id = peer_id.to_string();
+            wait_state(hub, "drone ready", |s| {
+                s.peers
+                    .iter()
+                    .any(|(c, p)| p.peer_id == id && !s.busy_answerers.contains(c))
+            })
+            .await;
+            Drone { tasks, out }
+        }
+
+        /// The first task of this type the drone has been given.
+        async fn task(&self, task_type: &str) -> serde_json::Value {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(t) = self
+                        .tasks
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|t| t["task_type"] == task_type)
+                    {
+                        return t.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no {task_type} task arrived"))
+        }
+
+        fn answer(&self, task: &serde_json::Value, text: &str) {
+            self.out
+                .send(serde_json::json!({"type":"result","task_id":task["task_id"],"text":text,"tok_s":10.0,"tokens":5,"inference_ms":5}))
+                .unwrap();
+        }
+    }
+
+    fn ask(text: &str) -> serde_json::Value {
+        serde_json::json!({"type":"message","text":text})
+    }
+
+    #[tokio::test]
+    async fn a_result_counts_only_from_the_connection_the_task_went_to() {
+        let (hub, addr) = hub_serving().await;
+        let d1 = Drone::join(&hub, addr, "d1").await;
+        let mut asker = connect(addr).await;
+        let mut attacker = connect(addr).await;
+        send_json(&mut asker, ask("hi")).await;
+        let task = d1.task("answer").await;
+
+        send_json(
+            &mut attacker,
+            serde_json::json!({"type":"result","task_id":task["task_id"],"text":"forged","tok_s":1.0,"tokens":1,"inference_ms":1}),
+        )
+        .await;
+        assert!(next_of_type(&mut asker, "response", 300).await.is_none());
+
+        d1.answer(&task, "real");
+        let response = next_of_type(&mut asker, "response", 3000).await.unwrap();
+        assert_eq!(response["text"], "real");
+    }
+
+    #[tokio::test]
+    async fn a_second_result_from_the_same_drone_is_ignored() {
+        let (hub, addr) = hub_serving().await;
+        let drones = [
+            Drone::join(&hub, addr, "d1").await,
+            Drone::join(&hub, addr, "d2").await,
+            Drone::join(&hub, addr, "d3").await,
+        ];
+        let mut asker = connect(addr).await;
+        send_json(&mut asker, ask("hi")).await;
+        let task = drones[0].task("answer").await;
+        for _ in 0..3 {
+            drones[0].answer(&task, "again");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let state = hub.state.lock().await;
+        let message = state
+            .messages
+            .values()
+            .find(|m| m.task_type == TaskType::Answer)
+            .unwrap();
+        assert_eq!(message.results.len(), 1);
+        assert_eq!(message.phase, MessagePhase::Generating);
     }
 }
