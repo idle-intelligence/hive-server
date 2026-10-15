@@ -297,14 +297,6 @@ impl Hub {
                 let has_answerer =
                     parsed_capabilities.contains(&crate::state::Capability::Answerer);
 
-                // Emit join log
-                let line = if has_answerer {
-                    hlog::peer_joined_benchmarking(&peer_id, &model, &model_size)
-                } else {
-                    hlog::peer_joined_tagger(&peer_id, &model, &model_size)
-                };
-                self.emit(&line).await;
-
                 let info = PeerInfo {
                     peer_id: peer_id.clone(),
                     model: model.clone(),
@@ -314,55 +306,32 @@ impl Hub {
                     capabilities: parsed_capabilities,
                 };
 
-                let stale_conn_id;
-                {
+                // A peer_id belongs to the live connection that registered it.
+                let taken = {
                     let mut state = self.state.lock().await;
-
-                    // Check for duplicate peer_id and evict stale entry
-                    stale_conn_id = state
+                    let taken = state
                         .peers
                         .iter()
-                        .find(|(_, info)| info.peer_id == peer_id)
-                        .map(|(conn_id, _)| *conn_id);
-
-                    if let Some(old_id) = stale_conn_id {
-                        // Remove stale entry from peers and busy sets
-                        state.peers.remove(&old_id);
-                        state.busy_answerers.remove(&old_id);
-                        state.busy_taggers.remove(&old_id);
-
-                        // Clean up any pending tasks assigned to the old conn_id
-                        let mut tasks_to_remove = Vec::new();
-                        for (task_id, message_id) in &state.task_to_message {
-                            if let Some(q) = state.messages.get(message_id) {
-                                if q.gen_peers.contains(&old_id)
-                                    || q.arbiter_conn_id == Some(old_id)
-                                {
-                                    tasks_to_remove.push((task_id.clone(), message_id.clone()));
-                                }
-                            }
-                        }
-                        for (task_id, message_id) in tasks_to_remove {
-                            state.task_to_message.remove(&task_id);
-                            state.messages.remove(&message_id);
-                        }
+                        .any(|(id, p)| p.peer_id == peer_id && *id != conn_id);
+                    if !taken {
+                        state.add_peer(conn_id, info);
                     }
-
-                    state.add_peer(conn_id, info);
+                    taken
+                };
+                if taken {
+                    let err = HubMsg::Error {
+                        text: "peer_id is already in use".to_string(),
+                    };
+                    self.send_to(conn_id, &err).await;
+                    return;
                 }
 
-                // Remove old connection's sender if we evicted a stale entry
-                if let Some(old_id) = stale_conn_id {
-                    if let Some(conn) = self.senders.lock().unwrap().remove(&old_id) {
-                        conn.writer.abort();
-                    }
-                    let line = format!(
-                        "{} [peer] {} reconnected (replaced stale connection)",
-                        hlog::ts(),
-                        peer_id
-                    );
-                    self.emit(&line).await;
-                }
+                let line = if has_answerer {
+                    hlog::peer_joined_benchmarking(&peer_id, &model, &model_size)
+                } else {
+                    hlog::peer_joined_tagger(&peer_id, &model, &model_size)
+                };
+                self.emit(&line).await;
 
                 let count = self.state.lock().await.peer_count();
                 let status = hlog::swarm_status(count);
@@ -2108,6 +2077,7 @@ mod tests {
         conn_id: usize,
         tasks: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         out: mpsc::UnboundedSender<serde_json::Value>,
+        task: tokio::task::AbortHandle,
     }
 
     impl Drone {
@@ -2130,11 +2100,12 @@ mod tests {
             let tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
             let (out, mut outbox) = mpsc::unbounded_channel::<serde_json::Value>();
             let seen = Arc::clone(&tasks);
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         incoming = ws.next() => {
-                            let Some(Ok(Message::Text(text))) = incoming else { continue };
+                            let Some(Ok(msg)) = incoming else { break };
+                            let Message::Text(text) = msg else { continue };
                             let json: serde_json::Value = serde_json::from_str(&text).unwrap();
                             if json["type"] != "task" {
                                 continue;
@@ -2172,7 +2143,13 @@ mod tests {
                 conn_id,
                 tasks,
                 out,
+                task: handle.abort_handle(),
             }
+        }
+
+        /// Closes the drone's connection.
+        fn leave(&self) {
+            self.task.abort();
         }
 
         /// The first task of this type the drone has been given.
@@ -2335,5 +2312,43 @@ mod tests {
             .clone();
         hub.handle_classify_timeout(&m_id).await;
         assert!(hub.state.lock().await.busy_taggers.is_empty());
+    }
+    fn register(peer_id: &str) -> serde_json::Value {
+        serde_json::json!({"type":"register","peer_id":peer_id,"model":"m","model_size":"1B","capabilities":["answerer"]})
+    }
+
+    #[tokio::test]
+    async fn a_peer_id_belongs_to_the_connection_that_registered_it() {
+        let (hub, addr) = hub_serving().await;
+        let first = Drone::join(&hub, addr, "same").await;
+
+        let mut second = connect(addr).await;
+        send_json(&mut second, register("same")).await;
+        let error = next_of_type(&mut second, "error", 3000).await.unwrap();
+        assert_eq!(error["text"], "peer_id is already in use");
+        {
+            let state = hub.state.lock().await;
+            assert_eq!(state.peers.len(), 1);
+            assert!(state.peers.contains_key(&first.conn_id));
+        }
+        assert!(hub.senders.lock().unwrap().contains_key(&first.conn_id));
+
+        // The old connection closing frees the id.
+        first.leave();
+        wait_state(&hub, "the first drone to leave", |s| s.peers.is_empty()).await;
+        send_json(&mut second, register("same")).await;
+        wait_state(&hub, "the second drone to join", |s| s.peers.len() == 1).await;
+    }
+
+    #[tokio::test]
+    async fn registering_again_on_the_same_connection_keeps_it_connected() {
+        let (hub, addr) = hub_serving().await;
+        let mut drone = connect(addr).await;
+        send_json(&mut drone, register("again")).await;
+        assert!(next_of_type(&mut drone, "task", 3000).await.is_some());
+        send_json(&mut drone, register("again")).await;
+        // The second registration gets its own benchmark task on the same connection.
+        assert!(next_of_type(&mut drone, "task", 3000).await.is_some());
+        assert_eq!(hub.state.lock().await.peers.len(), 1);
     }
 }
