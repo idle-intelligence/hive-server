@@ -26,6 +26,7 @@ async fn main() {
     let hub = hub::Hub::new();
     hub.start_stats_ticker();
     hub.start_time_ticker();
+    hub.start_sweeper();
 
     loop {
         let (stream, peer_addr) = match listener.accept().await {

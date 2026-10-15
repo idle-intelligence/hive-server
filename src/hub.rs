@@ -16,6 +16,7 @@ use crate::protocol::{ChatMessage, ClientMsg, HubMsg};
 use crate::router;
 use crate::state::{
     HubState, MessagePhase, PeerInfo, PendingMessage, QueuedMessage, TaskResult, TaskType,
+    MAX_LIVE_MESSAGES,
 };
 
 /// SmolLM2 1.7B ≈ 1.7B params × 2 ops/param = 3.4 GFLOPS per token
@@ -499,7 +500,15 @@ impl Hub {
         text: String,
         messages: Vec<crate::protocol::ChatMessage>,
     ) {
-        let m_id = format!("m_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        if self.state.lock().await.messages.len() >= MAX_LIVE_MESSAGES {
+            let err = HubMsg::Error {
+                text: "The hub is full, try again later".to_string(),
+            };
+            self.send_to(probe_conn_id, &err).await;
+            return;
+        }
+
+        let m_id = format!("m_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
 
         let line = hlog::message_received(&m_id, &text);
         self.emit(&line).await;
@@ -1566,6 +1575,17 @@ impl Hub {
         });
     }
 
+    pub fn start_sweeper(self: &Arc<Self>) {
+        let hub = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                hub.state.lock().await.sweep_done();
+            }
+        });
+    }
+
     pub fn start_time_ticker(self: &Arc<Self>) {
         let hub = Arc::clone(self);
         tokio::spawn(async move {
@@ -1827,5 +1847,91 @@ mod tests {
             let state = hub.state.lock().await;
             assert_eq!(state.messages[m_id].phase, MessagePhase::Done);
         }
+    }
+    #[tokio::test]
+    async fn sweep_drops_old_finished_messages_and_their_task_ids() {
+        let (hub, _page, conn_id) = hub_with_page().await;
+        let old = Instant::now()
+            .checked_sub(crate::state::DONE_KEEP + Duration::from_secs(1))
+            .unwrap();
+        for (m_id, phase, start) in [
+            ("m_old_done", MessagePhase::Done, old),
+            ("m_new_done", MessagePhase::Done, Instant::now()),
+            ("m_old_live", MessagePhase::Generating, old),
+        ] {
+            pending(&hub, m_id, conn_id, TaskType::Answer).await;
+            let mut state = hub.state.lock().await;
+            let m = state.messages.get_mut(m_id).unwrap();
+            m.phase = phase;
+            m.start = start;
+            state
+                .task_to_message
+                .insert(format!("task_{m_id}"), m_id.to_string());
+        }
+        hub.state.lock().await.sweep_done();
+        let state = hub.state.lock().await;
+        assert!(!state.messages.contains_key("m_old_done"));
+        assert!(state.messages.contains_key("m_new_done"));
+        assert!(state.messages.contains_key("m_old_live"));
+        assert!(!state.task_to_message.contains_key("task_m_old_done"));
+        assert!(state.task_to_message.contains_key("task_m_new_done"));
+        assert!(state.task_to_message.contains_key("task_m_old_live"));
+    }
+
+    #[tokio::test]
+    async fn new_questions_are_refused_when_the_hub_is_full() {
+        let (hub, mut page, conn_id) = hub_with_page().await;
+        {
+            let mut state = hub.state.lock().await;
+            for i in 0..MAX_LIVE_MESSAGES {
+                state.messages.insert(
+                    format!("m_{i}"),
+                    PendingMessage {
+                        message_id: String::new(),
+                        probe_conn_id: 0,
+                        text: String::new(),
+                        messages: Vec::new(),
+                        task_id: String::new(),
+                        gen_peers: Vec::new(),
+                        results: Vec::new(),
+                        expected_results: 0,
+                        arbiter_task_id: None,
+                        arbiter_conn_id: None,
+                        start: Instant::now(),
+                        phase: MessagePhase::Done,
+                        task_type: TaskType::Answer,
+                        route_tag: None,
+                        classify_task_id: None,
+                        classify_conn_id: None,
+                    },
+                );
+            }
+        }
+        hub.process_incoming_message(
+            conn_id,
+            "hi".to_string(),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+        )
+        .await;
+        assert_eq!(
+            next_error(&mut page).await,
+            "The hub is full, try again later"
+        );
+        assert_eq!(hub.state.lock().await.messages.len(), MAX_LIVE_MESSAGES);
+    }
+
+    #[tokio::test]
+    async fn message_ids_carry_sixteen_random_hex_digits() {
+        let (hub, _page, conn_id) = hub_with_page().await;
+        hub.process_incoming_message(conn_id, "hi".to_string(), Vec::new())
+            .await;
+        let state = hub.state.lock().await;
+        let id = &state.normal_queue[0].message_id;
+        let hex = id.strip_prefix("m_").unwrap();
+        assert_eq!(hex.len(), 16);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

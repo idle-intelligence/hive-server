@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub enum Capability {
@@ -91,6 +91,11 @@ pub struct QueuedMessage {
     pub arbitration_for: Option<String>,
 }
 
+/// A finished message is dropped from memory once this long has passed since it started.
+pub const DONE_KEEP: Duration = Duration::from_secs(5 * 60);
+/// The most messages the hub holds at once. Beyond it, new questions are refused.
+pub const MAX_LIVE_MESSAGES: usize = 100_000;
+
 const MAX_NORMAL_QUEUE: usize = 20;
 const MAX_LOW_QUEUE: usize = 10;
 
@@ -139,6 +144,14 @@ impl HubState {
         if let Some(peer) = self.peers.get_mut(&conn_id) {
             peer.load = load;
         }
+    }
+
+    /// Drops finished messages older than `DONE_KEEP` and the task ids that point to them.
+    pub fn sweep_done(&mut self) {
+        self.messages
+            .retain(|_, m| !(m.phase == MessagePhase::Done && m.start.elapsed() > DONE_KEEP));
+        self.task_to_message
+            .retain(|_, m_id| self.messages.contains_key(m_id));
     }
 
     pub fn peer_count(&self) -> usize {
