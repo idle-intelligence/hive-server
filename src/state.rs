@@ -68,6 +68,8 @@ pub struct PendingMessage {
     pub task_id: String,
     pub gen_peers: Vec<usize>,
     pub results: Vec<TaskResult>,
+    /// Generation peers that reported the task failed.
+    pub failed: Vec<usize>,
     pub expected_results: usize,
     pub arbiter_task_id: Option<String>,
     pub arbiter_conn_id: Option<usize>,
@@ -88,7 +90,9 @@ impl PendingMessage {
         } else if self.arbiter_task_id.as_deref() == Some(task_id) {
             self.arbiter_conn_id == Some(conn_id)
         } else {
-            self.gen_peers.contains(&conn_id) && !self.results.iter().any(|r| r.conn_id == conn_id)
+            self.gen_peers.contains(&conn_id)
+                && !self.failed.contains(&conn_id)
+                && !self.results.iter().any(|r| r.conn_id == conn_id)
         }
     }
 }
@@ -180,7 +184,7 @@ impl HubState {
         let silent = m
             .gen_peers
             .iter()
-            .filter(|c| !m.results.iter().any(|r| r.conn_id == **c));
+            .filter(|c| !m.failed.contains(c) && !m.results.iter().any(|r| r.conn_id == **c));
         let arbiter = m
             .arbiter_conn_id
             .filter(|_| m.phase == MessagePhase::Arbitrating);

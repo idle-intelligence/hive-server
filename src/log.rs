@@ -68,6 +68,16 @@ pub fn task_completed(
     )
 }
 
+pub fn task_failed(task_id: &str, peer_id: &str, reason: &str) -> String {
+    format!(
+        "{} [task {}] {} failed ({})",
+        ts(),
+        task_id,
+        peer_id,
+        reason
+    )
+}
+
 pub fn result_ignored(task_id: &str, peer_id: &str) -> String {
     format!(
         "{} [task {}] ignored a result from {} (not expected from it)",

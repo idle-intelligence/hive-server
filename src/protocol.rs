@@ -26,6 +26,11 @@ pub enum ClientMsg {
         tokens: u32,
         inference_ms: u64,
     },
+    TaskFailed {
+        task_id: String,
+        #[serde(default)]
+        reason: String,
+    },
     Heartbeat {
         peer_id: String,
         load: f64,
@@ -112,6 +117,17 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(m, ClientMsg::Message { text: Some(t), .. } if t == "hi"));
+    }
+
+    #[test]
+    fn parses_task_failed() {
+        let m: ClientMsg = serde_json::from_str(
+            r#"{"type":"task_failed","task_id":"t1","reason":"out of memory"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(m, ClientMsg::TaskFailed { task_id, reason } if task_id == "t1" && reason == "out of memory")
+        );
     }
 
     #[test]

@@ -375,6 +375,7 @@ impl Hub {
                             task_id: bench_task_id.clone(),
                             gen_peers: vec![conn_id],
                             results: Vec::new(),
+                            failed: Vec::new(),
                             expected_results: 1,
                             arbiter_task_id: None,
                             arbiter_conn_id: None,
@@ -429,6 +430,10 @@ impl Hub {
                 }
                 self.handle_result(conn_id, task_id, text, tok_s, tokens, inference_ms)
                     .await;
+            }
+
+            ClientMsg::TaskFailed { task_id, reason } => {
+                self.handle_task_failed(conn_id, task_id, reason).await;
             }
 
             ClientMsg::Heartbeat { peer_id: _, load } => {
@@ -670,6 +675,7 @@ impl Hub {
             task_id: task_id.clone(),
             gen_peers,
             results: Vec::new(),
+            failed: Vec::new(),
             expected_results: n,
             arbiter_task_id: None,
             arbiter_conn_id: None,
@@ -791,6 +797,7 @@ impl Hub {
             task_id: String::new(), // Will be set when transitioning to Generating
             gen_peers: Vec::new(),
             results: Vec::new(),
+            failed: Vec::new(),
             expected_results: 0,
             arbiter_task_id: None,
             arbiter_conn_id: None,
@@ -969,6 +976,64 @@ impl Hub {
     }
 
     // ── Result handling ─────────────────────────────────────────────
+
+    /// A peer says it could not do a task. Its result is treated as absent: the peer is
+    /// free again, and if no other result can come the task times out at once.
+    async fn handle_task_failed(self: &Arc<Self>, conn_id: usize, task_id: String, reason: String) {
+        let task_id = crate::validate::sanitize_field(&task_id, "task");
+        let reason = crate::validate::sanitize_field(&reason, "unknown");
+
+        // None: the task was not given to this connection.
+        let checked = {
+            let mut state = self.state.lock().await;
+            let peer_id = state
+                .peers
+                .get(&conn_id)
+                .map(|p| p.peer_id.clone())
+                .unwrap_or_else(|| format!("conn_{conn_id}"));
+            let message_id = state.task_to_message.get(&task_id).cloned();
+            let found = message_id.and_then(|id| {
+                let m = state.messages.get(&id)?;
+                m.expects_result_from(&task_id, conn_id).then(|| {
+                    let classify = m.classify_task_id.as_deref() == Some(task_id.as_str());
+                    let arbiter = m.arbiter_task_id.as_deref() == Some(task_id.as_str());
+                    (id, classify, arbiter)
+                })
+            });
+            match found {
+                None => Err(peer_id),
+                Some((id, classify, arbiter)) => {
+                    let mut timed_out = classify || arbiter;
+                    if !classify && !arbiter {
+                        state.busy_answerers.remove(&conn_id);
+                        let m = state.messages.get_mut(&id).unwrap();
+                        m.failed.push(conn_id);
+                        timed_out = m.phase == MessagePhase::Generating
+                            && m.results.len() + m.failed.len() >= m.expected_results;
+                    }
+                    Ok((peer_id, id, classify, timed_out))
+                }
+            }
+        };
+        let (peer_id, message_id, classify, timed_out) = match checked {
+            Ok(found) => found,
+            Err(peer_id) => {
+                let line = hlog::result_ignored(&task_id, &peer_id);
+                self.emit(&line).await;
+                return;
+            }
+        };
+
+        let line = hlog::task_failed(&task_id, &peer_id, &reason);
+        self.emit(&line).await;
+
+        if classify {
+            self.handle_classify_timeout(&message_id).await;
+        } else if timed_out {
+            self.handle_timeout(&message_id).await;
+        }
+        self.try_dispatch_queue().await;
+    }
 
     async fn handle_result(
         self: &Arc<Self>,
@@ -1856,6 +1921,7 @@ mod tests {
                 task_id: m_id.to_string(),
                 gen_peers: Vec::new(),
                 results: Vec::new(),
+                failed: Vec::new(),
                 expected_results: 1,
                 arbiter_task_id: None,
                 arbiter_conn_id: None,
@@ -1957,6 +2023,7 @@ mod tests {
                         task_id: String::new(),
                         gen_peers: Vec::new(),
                         results: Vec::new(),
+                        failed: Vec::new(),
                         expected_results: 0,
                         arbiter_task_id: None,
                         arbiter_conn_id: None,
@@ -2456,5 +2523,158 @@ mod tests {
         })
         .await;
         assert!(closed.is_ok());
+    }
+    fn failed(task: &serde_json::Value, reason: &str) -> serde_json::Value {
+        serde_json::json!({"type":"task_failed","task_id":task["task_id"],"reason":reason})
+    }
+
+    /// The drones that were given an answer task, once there are `n` of them.
+    async fn assigned_answerers(drones: &[Drone], n: usize) -> Vec<&Drone> {
+        for _ in 0..200 {
+            let assigned: Vec<&Drone> = drones
+                .iter()
+                .filter(|d| {
+                    d.tasks
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t["task_type"] == "answer")
+                })
+                .collect();
+            if assigned.len() == n {
+                return assigned;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("answer tasks were not given out");
+    }
+
+    #[tokio::test]
+    async fn a_failed_task_frees_the_drone_and_is_logged() {
+        let (hub, addr) = hub_serving().await;
+        let drones = [
+            Drone::join(&hub, addr, "d1").await,
+            Drone::join(&hub, addr, "d2").await,
+            Drone::join(&hub, addr, "d3").await,
+        ];
+        let mut asker = connect(addr).await;
+        send_json(&mut asker, ask("hi")).await;
+        let task = drones[1].task("answer").await;
+        drones[1]
+            .out
+            .send(failed(&task, &format!("out of memory {}", "x".repeat(200))))
+            .unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let log = next_of_type(&mut asker, "log", 3000).await.unwrap();
+                let line = log["line"].as_str().unwrap().to_string();
+                if line.contains("failed (") {
+                    return line;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(line.contains(&format!(
+            "[task {}] d2 failed (out_of_memory_",
+            task["task_id"].as_str().unwrap()
+        )));
+        assert!(line.trim_end_matches(')').len() < 120);
+        let conn = drones[1].conn_id;
+        wait_state(&hub, "the drone to be free", |s| {
+            !s.busy_answerers.contains(&conn)
+        })
+        .await;
+        // The others are still working, so the question is still open.
+        assert!(!hub
+            .state
+            .lock()
+            .await
+            .messages
+            .values()
+            .any(|m| m.phase == MessagePhase::Done));
+    }
+
+    #[tokio::test]
+    async fn when_no_other_result_can_come_the_question_ends_at_once() {
+        let (hub, addr) = hub_serving().await;
+        let drones = [
+            Drone::join(&hub, addr, "d1").await,
+            Drone::join(&hub, addr, "d2").await,
+            Drone::join(&hub, addr, "d3").await,
+        ];
+        let mut asker = connect(addr).await;
+        send_json(&mut asker, ask("hi")).await;
+        let task = drones[0].task("answer").await;
+        drones[0].answer(&task, "an answer");
+        drones[1]
+            .out
+            .send(failed(&drones[1].task("answer").await, "no"))
+            .unwrap();
+        drones[2]
+            .out
+            .send(failed(&drones[2].task("answer").await, "no"))
+            .unwrap();
+        // The timeout is 600 ms in tests. The answer comes long before.
+        let response = next_of_type(&mut asker, "response", 400).await.unwrap();
+        assert_eq!(response["text"], "an answer");
+        assert!(hub.state.lock().await.busy_answerers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn when_every_drone_fails_the_asker_hears_it_at_once() {
+        let (hub, addr) = hub_serving().await;
+        let drone = Drone::join(&hub, addr, "d1").await;
+        let mut asker = connect(addr).await;
+        send_json(&mut asker, ask("hi")).await;
+        drone
+            .out
+            .send(failed(&drone.task("answer").await, "no"))
+            .unwrap();
+        let error = next_of_type(&mut asker, "error", 400).await.unwrap();
+        assert_eq!(error["text"], "All peers timed out");
+    }
+
+    #[tokio::test]
+    async fn a_failed_arbiter_gives_the_first_answer_at_once() {
+        let (hub, addr) = hub_serving().await;
+        let drones = [
+            Drone::join(&hub, addr, "d1").await,
+            Drone::join(&hub, addr, "d2").await,
+            Drone::join(&hub, addr, "d3").await,
+            Drone::join(&hub, addr, "d4").await,
+        ];
+        let mut asker = connect(addr).await;
+        send_json(&mut asker, ask("hi")).await;
+        let assigned = assigned_answerers(&drones, 3).await;
+        for d in &assigned {
+            d.answer(&d.task("answer").await, "an answer");
+        }
+        let arbiter = drones
+            .iter()
+            .find(|d| !assigned.iter().any(|a| std::ptr::eq(*a, *d)))
+            .unwrap();
+        arbiter
+            .out
+            .send(failed(&arbiter.task("arbiter").await, "no"))
+            .unwrap();
+        let response = next_of_type(&mut asker, "response", 400).await.unwrap();
+        assert_eq!(response["text"], "an answer");
+        assert!(hub.state.lock().await.busy_answerers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failure_from_a_connection_the_task_was_not_given_to_is_ignored() {
+        let (hub, addr) = hub_serving().await;
+        let drone = Drone::join(&hub, addr, "d1").await;
+        let mut asker = connect(addr).await;
+        let mut attacker = connect(addr).await;
+        send_json(&mut asker, ask("hi")).await;
+        let task = drone.task("answer").await;
+        send_json(&mut attacker, failed(&task, "no")).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let state = hub.state.lock().await;
+        assert!(state.busy_answerers.contains(&drone.conn_id));
+        assert!(state.messages.values().all(|m| m.failed.is_empty()));
     }
 }
