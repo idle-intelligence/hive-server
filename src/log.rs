@@ -120,10 +120,17 @@ pub fn response_delivered(
     )
 }
 
-pub fn time_result(peer_id: &str, tokens: u32, flops: f64) -> String {
+/// `hive_text` is the sentence of a time question the hive asked itself; a
+/// user's answer is never logged.
+pub fn time_result(peer_id: &str, hive_text: Option<&str>, tokens: u32, flops: f64) -> String {
+    let text = match hive_text {
+        Some(t) => format!("\"{}\"", t.trim()),
+        None => "time answered".to_string(),
+    };
     format!(
-        "{} [time] time answered ({}, {} tok, {:.2e} FLOPS)",
+        "{} [time] {} ({}, {} tok, {:.2e} FLOPS)",
         ts(),
+        text,
         peer_id,
         tokens,
         flops
@@ -313,8 +320,10 @@ mod tests {
     }
 
     #[test]
-    fn time_result_says_time_answered() {
-        let line = time_result("p1", 7, 1e9);
+    fn time_result_shows_only_the_hives_own_sentence() {
+        let line = time_result("p1", None, 7, 1e9);
         assert!(line.contains("time answered") && line.contains("p1"));
+        let line = time_result("p1", Some("It is 12:00 in Paris."), 7, 1e9);
+        assert!(line.contains("It is 12:00 in Paris."));
     }
 }
