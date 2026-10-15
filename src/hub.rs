@@ -236,6 +236,9 @@ impl Hub {
                 tok_s,
                 capabilities,
             } => {
+                let peer_id = crate::validate::sanitize_field(&peer_id, "peer");
+                let model = crate::validate::sanitize_field(&model, "unknown");
+                let model_size = crate::validate::sanitize_field(&model_size, "unknown");
                 // Parse capabilities (default to [Answerer] for backward compat)
                 let parsed_capabilities: std::collections::HashSet<crate::state::Capability> =
                     capabilities
@@ -941,6 +944,7 @@ impl Hub {
         tokens: u32,
         inference_ms: u64,
     ) {
+        let task_id = crate::validate::sanitize_field(&task_id, "task");
         // Enforce 2000-character limit on result text (v1-protocol.md)
         if text.chars().count() > 2000 {
             let line = format!(
@@ -1011,7 +1015,7 @@ impl Hub {
                             .and_then(|v| v.as_str())
                             .unwrap_or("other");
                         let score = json.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        (label.to_string(), score, None)
+                        (crate::validate::known_label(label).to_string(), score, None)
                     }
                     Err(e) => {
                         // Parse failure → fallback to unrouted
@@ -1020,12 +1024,11 @@ impl Hub {
                 };
 
             // Log parse failure if it occurred
-            if let Some(err) = parse_error {
+            if parse_error.is_some() {
                 let line = format!(
-                    "{} [classify {}] JSON parse failed: {}, defaulting to other",
+                    "{} [classify {}] JSON parse failed, defaulting to other",
                     hlog::ts(),
-                    task_id,
-                    err
+                    task_id
                 );
                 self.emit(&line).await;
             }
