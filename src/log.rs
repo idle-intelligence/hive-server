@@ -120,20 +120,10 @@ pub fn response_delivered(
     )
 }
 
-/// Whether the time answer's text is shown in the public log. Off by default:
-/// the sentence is model output.
-pub const SHOW_TIME_TEXT: bool = false;
-
-pub fn time_result(peer_id: &str, result_text: &str, tokens: u32, flops: f64) -> String {
-    let text = if SHOW_TIME_TEXT {
-        format!("\"{}\"", result_text.trim())
-    } else {
-        "time answered".to_string()
-    };
+pub fn time_result(peer_id: &str, tokens: u32, flops: f64) -> String {
     format!(
-        "{} [time] {} ({}, {} tok, {:.2e} FLOPS)",
+        "{} [time] time answered ({}, {} tok, {:.2e} FLOPS)",
         ts(),
-        text,
         peer_id,
         tokens,
         flops
@@ -323,10 +313,8 @@ mod tests {
     }
 
     #[test]
-    fn time_result_hides_text_unless_flag_is_on() {
-        assert!(!SHOW_TIME_TEXT);
-        let line = time_result("p1", "It is 12:00 in Paris.", 7, 1e9);
-        assert!(!line.contains("Paris"));
+    fn time_result_says_time_answered() {
+        let line = time_result("p1", 7, 1e9);
         assert!(line.contains("time answered") && line.contains("p1"));
     }
 }

@@ -1236,7 +1236,7 @@ impl Hub {
             state.total_flops += flops;
             drop(state);
 
-            let line = hlog::time_result(&first.peer_id, &first.text, first.tokens, flops);
+            let line = hlog::time_result(&first.peer_id, first.tokens, flops);
             self.emit(&line).await;
 
             // User-initiated time query: send response back
