@@ -862,9 +862,14 @@ impl Hub {
             let text = message.text.clone();
             let messages = message.messages.clone();
 
+            let tagger = message.classify_conn_id;
+
             // Clear classify tracking (now safe — message borrow is done)
             if let Some(ref task_id) = cls_task_id {
                 state.task_to_message.remove(task_id);
+            }
+            if let Some(conn_id) = tagger {
+                state.busy_taggers.remove(&conn_id);
             }
             (cls_task_id, probe_conn_id, text, messages)
         };
@@ -1501,6 +1506,7 @@ impl Hub {
 
     async fn handle_timeout(self: &Arc<Self>, message_id: &str) {
         let mut state = self.state.lock().await;
+        state.release_unanswered(message_id);
         let message = match state.messages.get_mut(message_id) {
             Some(q) if q.phase != MessagePhase::Done => q,
             _ => return,
@@ -2099,16 +2105,26 @@ mod tests {
     /// A fake drone. It answers its own benchmark and records every other task; the test
     /// decides what it sends back.
     struct Drone {
+        conn_id: usize,
         tasks: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         out: mpsc::UnboundedSender<serde_json::Value>,
     }
 
     impl Drone {
         async fn join(hub: &Arc<Hub>, addr: std::net::SocketAddr, peer_id: &str) -> Drone {
+            Drone::join_as(hub, addr, peer_id, "answerer").await
+        }
+
+        async fn join_as(
+            hub: &Arc<Hub>,
+            addr: std::net::SocketAddr,
+            peer_id: &str,
+            capability: &str,
+        ) -> Drone {
             let mut ws = connect(addr).await;
             send_json(
                 &mut ws,
-                serde_json::json!({"type":"register","peer_id":peer_id,"model":"m","model_size":"1B","tok_s":10.0,"capabilities":["answerer"]}),
+                serde_json::json!({"type":"register","peer_id":peer_id,"model":"m","model_size":"1B","tok_s":10.0,"capabilities":[capability]}),
             )
             .await;
             let tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2143,7 +2159,20 @@ mod tests {
                     .any(|(c, p)| p.peer_id == id && !s.busy_answerers.contains(c))
             })
             .await;
-            Drone { tasks, out }
+            let conn_id = hub
+                .state
+                .lock()
+                .await
+                .peers
+                .iter()
+                .find(|(_, p)| p.peer_id == peer_id)
+                .map(|(c, _)| *c)
+                .unwrap();
+            Drone {
+                conn_id,
+                tasks,
+                out,
+            }
         }
 
         /// The first task of this type the drone has been given.
@@ -2262,5 +2291,49 @@ mod tests {
         spare.task("arbiter").await;
         let response = next_of_type(&mut asker, "response", 4000).await;
         assert_eq!(response.unwrap()["text"], "an answer");
+        assert!(hub.state.lock().await.busy_answerers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn peers_that_did_not_answer_in_time_can_take_work_again() {
+        let (hub, addr) = hub_serving().await;
+        let drones = [
+            Drone::join(&hub, addr, "d1").await,
+            Drone::join(&hub, addr, "d2").await,
+            Drone::join(&hub, addr, "d3").await,
+        ];
+        let mut asker = connect(addr).await;
+        send_json(&mut asker, ask("hi")).await;
+        drones[0].answer(&drones[0].task("answer").await, "an answer");
+        // The other two stay silent until the timeout delivers the one answer.
+        let response = next_of_type(&mut asker, "response", 4000).await;
+        assert_eq!(response.unwrap()["text"], "an answer");
+        assert!(hub.state.lock().await.busy_answerers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tagger_that_did_not_classify_in_time_can_take_work_again() {
+        let (hub, addr) = hub_serving().await;
+        let tagger = Drone::join_as(&hub, addr, "t1", "tagger").await;
+        let mut asker = connect(addr).await;
+        send_json(&mut asker, ask("hi")).await;
+        tagger.task("classify").await;
+        assert!(hub
+            .state
+            .lock()
+            .await
+            .busy_taggers
+            .contains(&tagger.conn_id));
+        let m_id = hub
+            .state
+            .lock()
+            .await
+            .messages
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        hub.handle_classify_timeout(&m_id).await;
+        assert!(hub.state.lock().await.busy_taggers.is_empty());
     }
 }

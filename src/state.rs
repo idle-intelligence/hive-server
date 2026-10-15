@@ -168,6 +168,28 @@ impl HubState {
             .retain(|_, m_id| self.messages.contains_key(m_id));
     }
 
+    /// A task timed out: the peers that did not answer it, and its arbiter if it has one
+    /// and the message waits on it, can take other work again.
+    pub fn release_unanswered(&mut self, m_id: &str) {
+        let Some(m) = self.messages.get(m_id) else {
+            return;
+        };
+        if m.phase == MessagePhase::Done {
+            return;
+        }
+        let silent = m
+            .gen_peers
+            .iter()
+            .filter(|c| !m.results.iter().any(|r| r.conn_id == **c));
+        let arbiter = m
+            .arbiter_conn_id
+            .filter(|_| m.phase == MessagePhase::Arbitrating);
+        let released: Vec<usize> = silent.copied().chain(arbiter).collect();
+        for conn_id in released {
+            self.busy_answerers.remove(&conn_id);
+        }
+    }
+
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
