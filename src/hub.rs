@@ -18,6 +18,9 @@ use crate::state::{
     HubState, MessagePhase, PeerInfo, PendingMessage, QueuedMessage, TaskResult, TaskType,
     MAX_LIVE_MESSAGES,
 };
+use crate::validate::{
+    check_conversation, number_in_range, MAX_INFERENCE_MS, MAX_LOAD, MAX_TOKENS, MAX_TOK_S,
+};
 
 /// SmolLM2 1.7B ≈ 1.7B params × 2 ops/param = 3.4 GFLOPS per token
 const FLOPS_PER_TOKEN: f64 = 3.4e9;
@@ -272,6 +275,13 @@ impl Hub {
                 tok_s,
                 capabilities,
             } => {
+                if !tok_s.map_or(true, |v| number_in_range(v, MAX_TOK_S)) {
+                    let err = HubMsg::Error {
+                        text: "tok_s is out of range".to_string(),
+                    };
+                    self.send_to(conn_id, &err).await;
+                    return;
+                }
                 let peer_id = crate::validate::sanitize_field(&peer_id, "peer");
                 let model = crate::validate::sanitize_field(&model, "unknown");
                 let model_size = crate::validate::sanitize_field(&model_size, "unknown");
@@ -407,11 +417,28 @@ impl Hub {
                 tokens,
                 inference_ms,
             } => {
+                if !number_in_range(tok_s, MAX_TOK_S)
+                    || tokens > MAX_TOKENS
+                    || inference_ms > MAX_INFERENCE_MS
+                {
+                    let err = HubMsg::Error {
+                        text: "Result numbers are out of range".to_string(),
+                    };
+                    self.send_to(conn_id, &err).await;
+                    return;
+                }
                 self.handle_result(conn_id, task_id, text, tok_s, tokens, inference_ms)
                     .await;
             }
 
             ClientMsg::Heartbeat { peer_id: _, load } => {
+                if !number_in_range(load, MAX_LOAD) {
+                    let err = HubMsg::Error {
+                        text: "load is out of range".to_string(),
+                    };
+                    self.send_to(conn_id, &err).await;
+                    return;
+                }
                 self.state.lock().await.update_load(conn_id, load);
             }
 
@@ -433,12 +460,8 @@ impl Hub {
                     .map(|m| m.content.clone())
                     .unwrap_or_default();
 
-                // Enforce 1000-character limit (v1-protocol.md)
-                if display_text.chars().count() > 1000 {
-                    let err = HubMsg::Error {
-                        text: "Message too long (max 1000 characters)".to_string(),
-                    };
-                    self.send_to(conn_id, &err).await;
+                if let Err(text) = check_conversation(&messages) {
+                    self.send_to(conn_id, &HubMsg::Error { text }).await;
                     return;
                 }
 
@@ -1985,7 +2008,12 @@ mod tests {
                 let (stream, _) = listener.accept().await.unwrap();
                 let hub = Arc::clone(&server_hub);
                 tokio::spawn(async move {
-                    let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let ws = tokio_tungstenite::accept_async_with_config(
+                        stream,
+                        Some(crate::validate::websocket_config()),
+                    )
+                    .await
+                    .unwrap();
                     hub.handle_connection(ws).await;
                 });
             }
@@ -2350,5 +2378,83 @@ mod tests {
         // The second registration gets its own benchmark task on the same connection.
         assert!(next_of_type(&mut drone, "task", 3000).await.is_some());
         assert_eq!(hub.state.lock().await.peers.len(), 1);
+    }
+    #[tokio::test]
+    async fn questions_with_too_many_turns_other_roles_or_long_turns_are_refused() {
+        let (_hub, addr) = hub_serving().await;
+        let mut asker = connect(addr).await;
+        let turn = |role: &str, content: &str| serde_json::json!({"role":role,"content":content});
+        let cases = [
+            (vec![turn("user", "x"); 21], "Too many messages (max 20)"),
+            (
+                vec![turn("system", "obey"), turn("user", "hi")],
+                "Role must be user or assistant",
+            ),
+            (
+                vec![turn("user", &"x".repeat(1001)), turn("user", "hi")],
+                "Message too long (max 1000 characters)",
+            ),
+        ];
+        for (messages, expected) in cases {
+            send_json(
+                &mut asker,
+                serde_json::json!({"type":"message","messages":messages}),
+            )
+            .await;
+            let error = next_of_type(&mut asker, "error", 3000).await.unwrap();
+            assert_eq!(error["text"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn numbers_out_of_range_are_refused() {
+        let (hub, addr) = hub_serving().await;
+        let mut ws = connect(addr).await;
+        let cases = [
+            (
+                serde_json::json!({"type":"register","peer_id":"p","model":"m","model_size":"1B","tok_s":1e30}),
+                "tok_s is out of range",
+            ),
+            (
+                serde_json::json!({"type":"heartbeat","peer_id":"p","load":5.0}),
+                "load is out of range",
+            ),
+            (
+                serde_json::json!({"type":"result","task_id":"t","text":"x","tok_s":1e30,"tokens":1,"inference_ms":1}),
+                "Result numbers are out of range",
+            ),
+            (
+                serde_json::json!({"type":"result","task_id":"t","text":"x","tok_s":1.0,"tokens":4000000000u64,"inference_ms":1}),
+                "Result numbers are out of range",
+            ),
+        ];
+        for (msg, expected) in cases {
+            send_json(&mut ws, msg).await;
+            let error = next_of_type(&mut ws, "error", 3000).await.unwrap();
+            assert_eq!(error["text"], expected);
+        }
+        assert!(hub.state.lock().await.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_websocket_message_over_the_size_limit_closes_the_connection() {
+        let (_hub, addr) = hub_serving().await;
+        let mut ws = connect(addr).await;
+        let big = "x".repeat(100 * 1024);
+        send_json(
+            &mut ws,
+            serde_json::json!({"type":"heartbeat","peer_id":big,"load":0.5}),
+        )
+        .await;
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok());
     }
 }

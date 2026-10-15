@@ -6,7 +6,7 @@ mod state;
 mod validate;
 
 use tokio::net::TcpListener;
-use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use validate::OriginPolicy;
 
@@ -53,7 +53,9 @@ async fn main() {
                     Err(err)
                 }
             };
-            match accept_hdr_async(stream, check).await {
+            match accept_hdr_async_with_config(stream, check, Some(validate::websocket_config()))
+                .await
+            {
                 Ok(ws) => hub.handle_connection(ws).await,
                 Err(e) => eprintln!("websocket handshake error: {e}"),
             }

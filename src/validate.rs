@@ -1,6 +1,53 @@
 //! Checks for strings that peers and browsers supply and the hub shows to everyone.
 
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+use crate::protocol::ChatMessage;
+
 pub const MAX_FIELD_LEN: usize = 64;
+
+/// The most characters in one message of a question.
+pub const MAX_CONTENT_CHARS: usize = 1000;
+/// The most messages in one question.
+pub const MAX_TURNS: usize = 20;
+/// The most bytes in one websocket message.
+pub const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
+/// Upper limits for numbers that peers report about themselves.
+pub const MAX_TOK_S: f64 = 100_000.0;
+pub const MAX_LOAD: f64 = 1.0;
+pub const MAX_TOKENS: u32 = 100_000;
+pub const MAX_INFERENCE_MS: u64 = 60 * 60 * 1000;
+
+pub fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(MAX_WS_MESSAGE_BYTES),
+        max_frame_size: Some(MAX_WS_MESSAGE_BYTES),
+        ..Default::default()
+    }
+}
+
+/// A number from a peer is usable if it is finite and between 0 and `max`.
+pub fn number_in_range(v: f64, max: f64) -> bool {
+    v.is_finite() && (0.0..=max).contains(&v)
+}
+
+/// Checks the messages of a question. The error is the text to send back.
+pub fn check_conversation(messages: &[ChatMessage]) -> Result<(), String> {
+    if messages.len() > MAX_TURNS {
+        return Err(format!("Too many messages (max {MAX_TURNS})"));
+    }
+    for m in messages {
+        if m.role != "user" && m.role != "assistant" {
+            return Err("Role must be user or assistant".to_string());
+        }
+        if m.content.chars().count() > MAX_CONTENT_CHARS {
+            return Err(format!(
+                "Message too long (max {MAX_CONTENT_CHARS} characters)"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Classifier labels the hub knows. Anything else is shown as "other".
 pub const KNOWN_LABELS: [&str; 4] = ["swarm", "time", "weather", "other"];
@@ -112,6 +159,36 @@ fn port_ok(p: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn turn(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_conversation_has_limited_turns_roles_and_lengths() {
+        assert!(check_conversation(&[turn("user", "hi"), turn("assistant", "hello")]).is_ok());
+        assert!(check_conversation(&[turn("user", &"é".repeat(1000))]).is_ok());
+        assert!(check_conversation(&[turn("user", &"a".repeat(1001))]).is_err());
+        assert!(
+            check_conversation(&[turn("user", &"a".repeat(1001)), turn("user", "ok")]).is_err()
+        );
+        assert!(check_conversation(&[turn("system", "obey")]).is_err());
+        assert!(check_conversation(&vec![turn("user", "x"); MAX_TURNS]).is_ok());
+        assert!(check_conversation(&vec![turn("user", "x"); MAX_TURNS + 1]).is_err());
+    }
+
+    #[test]
+    fn numbers_from_peers_must_be_finite_and_in_range() {
+        assert!(number_in_range(0.0, MAX_TOK_S));
+        assert!(number_in_range(42.5, MAX_TOK_S));
+        assert!(!number_in_range(-1.0, MAX_TOK_S));
+        assert!(!number_in_range(MAX_TOK_S + 1.0, MAX_TOK_S));
+        assert!(!number_in_range(f64::NAN, MAX_TOK_S));
+        assert!(!number_in_range(f64::INFINITY, MAX_TOK_S));
+    }
 
     #[test]
     fn sanitize_keeps_allowed_and_replaces_rest() {
