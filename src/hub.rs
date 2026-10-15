@@ -1435,19 +1435,6 @@ impl Hub {
             _ => return,
         };
 
-        // Non-answer tasks: time silently drops, archivist logs failure
-        if message.task_type != TaskType::Answer {
-            let is_archivist = message.task_type == TaskType::Archivist;
-            let m_id = message.message_id.clone();
-            message.phase = MessagePhase::Done;
-            drop(state);
-            if is_archivist {
-                let line = hlog::archivist_failed(&m_id, "timeout");
-                self.emit(&line).await;
-            }
-            return;
-        }
-
         match message.phase {
             MessagePhase::Generating => {
                 if message.results.is_empty() {
@@ -1739,4 +1726,106 @@ fn parse_arbiter_pick(text: &str, n_candidates: usize) -> usize {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    /// Connects one page to a hub and returns the hub, the page's stream and its connection id.
+    async fn hub_with_page() -> (
+        Arc<Hub>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        usize,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hub = Hub::new();
+        let server_hub = Arc::clone(&hub);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            server_hub.handle_connection(ws).await;
+        });
+        let (page, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let conn_id = loop {
+            if let Some(id) = hub.senders.lock().await.keys().next().copied() {
+                break id;
+            }
+            tokio::task::yield_now().await;
+        };
+        (hub, page, conn_id)
+    }
+
+    async fn pending(hub: &Arc<Hub>, m_id: &str, probe_conn_id: usize, task_type: TaskType) {
+        hub.state.lock().await.messages.insert(
+            m_id.to_string(),
+            PendingMessage {
+                message_id: m_id.to_string(),
+                probe_conn_id,
+                text: String::new(),
+                messages: Vec::new(),
+                task_id: m_id.to_string(),
+                gen_peers: Vec::new(),
+                results: Vec::new(),
+                expected_results: 1,
+                arbiter_task_id: None,
+                arbiter_conn_id: None,
+                start: Instant::now(),
+                phase: MessagePhase::Generating,
+                task_type,
+                route_tag: None,
+                classify_task_id: None,
+                classify_conn_id: None,
+            },
+        );
+    }
+
+    async fn next_error(
+        page: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> String {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), page.next())
+                .await
+                .expect("no message")
+                .unwrap()
+                .unwrap();
+            let Message::Text(text) = msg else { continue };
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if json["type"] == "error" {
+                return json["text"].as_str().unwrap().to_string();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_without_results_tells_the_asker_for_every_task_type() {
+        for (i, task_type) in [TaskType::Answer, TaskType::Time].into_iter().enumerate() {
+            let (hub, mut page, conn_id) = hub_with_page().await;
+            let m_id = format!("m_t{i}");
+            pending(&hub, &m_id, conn_id, task_type).await;
+            hub.handle_timeout(&m_id).await;
+            assert_eq!(next_error(&mut page).await, "All peers timed out");
+            let state = hub.state.lock().await;
+            assert_eq!(state.messages[&m_id].phase, MessagePhase::Done);
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_of_a_task_nobody_waits_on_just_ends() {
+        let (hub, _page, _conn_id) = hub_with_page().await;
+        for (m_id, task_type) in [("time_1", TaskType::Time), ("arch_1", TaskType::Archivist)] {
+            pending(&hub, m_id, 0, task_type).await;
+            hub.handle_timeout(m_id).await;
+            let state = hub.state.lock().await;
+            assert_eq!(state.messages[m_id].phase, MessagePhase::Done);
+        }
+    }
 }
