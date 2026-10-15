@@ -36,7 +36,7 @@ pub struct PeerInfo {
     pub model: String,
     pub model_size: String,
     pub tok_s: f64,
-    pub load: f64,  // TODO: V2 weighted routing (currently updated via heartbeat but not used)
+    pub load: f64, // TODO: V2 weighted routing (currently updated via heartbeat but not used)
     pub capabilities: HashSet<Capability>,
 }
 

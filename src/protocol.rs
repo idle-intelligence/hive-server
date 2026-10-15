@@ -80,3 +80,48 @@ pub enum HubMsg {
         text: String,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_register_with_defaults() {
+        let m: ClientMsg = serde_json::from_str(
+            r#"{"type":"register","peer_id":"p1","model":"m","model_size":"1B"}"#,
+        )
+        .unwrap();
+        match m {
+            ClientMsg::Register {
+                peer_id,
+                tok_s,
+                capabilities,
+                ..
+            } => {
+                assert_eq!(peer_id, "p1");
+                assert!(tok_s.is_none() && capabilities.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parses_message_ignoring_old_fields() {
+        let m: ClientMsg = serde_json::from_str(
+            r#"{"type":"message","text":"hi","route":"swarm","classifier_ms":3,"classifier_score":0.9}"#,
+        )
+        .unwrap();
+        assert!(matches!(m, ClientMsg::Message { text: Some(t), .. } if t == "hi"));
+    }
+
+    #[test]
+    fn rejects_unknown_type() {
+        assert!(serde_json::from_str::<ClientMsg>(r#"{"type":"nope"}"#).is_err());
+    }
+
+    #[test]
+    fn log_serializes_with_type_tag() {
+        let s = serde_json::to_string(&HubMsg::Log { line: "x".into() }).unwrap();
+        assert_eq!(s, r#"{"type":"log","line":"x"}"#);
+    }
+}

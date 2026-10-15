@@ -14,12 +14,15 @@ use tokio_tungstenite::WebSocketStream;
 use crate::log as hlog;
 use crate::protocol::{ChatMessage, ClientMsg, HubMsg};
 use crate::router;
-use crate::state::{HubState, PeerInfo, PendingMessage, QueuedMessage, MessagePhase, TaskResult, TaskType};
+use crate::state::{
+    HubState, MessagePhase, PeerInfo, PendingMessage, QueuedMessage, TaskResult, TaskType,
+};
 
 /// SmolLM2 1.7B ≈ 1.7B params × 2 ops/param = 3.4 GFLOPS per token
 const FLOPS_PER_TOKEN: f64 = 3.4e9;
 
-const SWARM_SYSTEM_PROMPT: &str = "You are one node in a distributed swarm of small language models running in \
+const SWARM_SYSTEM_PROMPT: &str =
+    "You are one node in a distributed swarm of small language models running in \
 browser tabs. You have been given real-time data about the swarm's current state.\n\
 \n\
 Answer ONLY using the data provided below. Do not make up numbers. If the data \
@@ -43,7 +46,8 @@ fn format_yaml_value(val: &serde_json::Value) -> String {
             format!("[{}]", items.join(", "))
         }
         serde_json::Value::Object(map) => {
-            let items: Vec<String> = map.iter()
+            let items: Vec<String> = map
+                .iter()
                 .map(|(k, v)| format!("{}: {}", k, format_yaml_value(v)))
                 .collect();
             format!("{{{}}}", items.join(", "))
@@ -52,7 +56,9 @@ fn format_yaml_value(val: &serde_json::Value) -> String {
 }
 
 fn json_to_compact_yaml(value: &serde_json::Value) -> String {
-    let obj = value.as_object().expect("json_to_compact_yaml: top level must be an object");
+    let obj = value
+        .as_object()
+        .expect("json_to_compact_yaml: top level must be an object");
     obj.iter()
         .map(|(key, val)| format!("{}: {}", key, format_yaml_value(val)))
         .collect::<Vec<_>>()
@@ -144,26 +150,47 @@ impl Hub {
         self.senders.lock().await.remove(&conn_id);
 
         // Handle classify disconnect: find messages stuck in Classifying phase with this peer
-        let classify_fallback_messages: Vec<(String, usize, String, Vec<crate::protocol::ChatMessage>)> = {
+        let classify_fallback_messages: Vec<(
+            String,
+            usize,
+            String,
+            Vec<crate::protocol::ChatMessage>,
+        )> = {
             let mut state = self.state.lock().await;
             let mut fallbacks = Vec::new();
             for (m_id, msg) in state.messages.iter_mut() {
-                if msg.phase == MessagePhase::Classifying
-                    && msg.classify_conn_id == Some(conn_id)
-                {
-                    msg.phase = MessagePhase::Generating;  // Prevent timeout race
-                    fallbacks.push((m_id.clone(), msg.probe_conn_id, msg.text.clone(), msg.messages.clone()));
+                if msg.phase == MessagePhase::Classifying && msg.classify_conn_id == Some(conn_id) {
+                    msg.phase = MessagePhase::Generating; // Prevent timeout race
+                    fallbacks.push((
+                        m_id.clone(),
+                        msg.probe_conn_id,
+                        msg.text.clone(),
+                        msg.messages.clone(),
+                    ));
                 }
             }
             fallbacks
         };
 
         for (m_id, probe_conn_id, text, messages) in classify_fallback_messages {
-            let line = format!("{} [classify] tagger disconnected, proceeding unrouted", hlog::ts());
+            let line = format!(
+                "{} [classify] tagger disconnected, proceeding unrouted",
+                hlog::ts()
+            );
             self.emit(&line).await;
 
             // Transition to Generating with route_tag=None
-            if self.route_message(&m_id, probe_conn_id, &text, &messages, TaskType::Answer, None).await {
+            if self
+                .route_message(
+                    &m_id,
+                    probe_conn_id,
+                    &text,
+                    &messages,
+                    TaskType::Answer,
+                    None,
+                )
+                .await
+            {
                 continue;
             }
 
@@ -173,7 +200,9 @@ impl Hub {
                 drop(state);
                 let line = hlog::queue_full(&m_id);
                 self.emit(&line).await;
-                let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
+                let err = HubMsg::Error {
+                    text: "No peers available and queue is full".to_string(),
+                };
                 self.send_to(probe_conn_id, &err).await;
             } else {
                 state.normal_queue.push_back(QueuedMessage {
@@ -200,7 +229,13 @@ impl Hub {
 
     async fn handle_message(self: &Arc<Self>, conn_id: usize, msg: ClientMsg) {
         match msg {
-            ClientMsg::Register { peer_id, model, model_size, tok_s, capabilities } => {
+            ClientMsg::Register {
+                peer_id,
+                model,
+                model_size,
+                tok_s,
+                capabilities,
+            } => {
                 // Parse capabilities (default to [Answerer] for backward compat)
                 let parsed_capabilities: std::collections::HashSet<crate::state::Capability> =
                     capabilities
@@ -220,7 +255,8 @@ impl Hub {
                             caps
                         });
 
-                let has_answerer = parsed_capabilities.contains(&crate::state::Capability::Answerer);
+                let has_answerer =
+                    parsed_capabilities.contains(&crate::state::Capability::Answerer);
 
                 // Emit join log
                 let line = if has_answerer {
@@ -244,7 +280,9 @@ impl Hub {
                     let mut state = self.state.lock().await;
 
                     // Check for duplicate peer_id and evict stale entry
-                    stale_conn_id = state.peers.iter()
+                    stale_conn_id = state
+                        .peers
+                        .iter()
                         .find(|(_, info)| info.peer_id == peer_id)
                         .map(|(conn_id, _)| *conn_id);
 
@@ -258,7 +296,9 @@ impl Hub {
                         let mut tasks_to_remove = Vec::new();
                         for (task_id, message_id) in &state.task_to_message {
                             if let Some(q) = state.messages.get(message_id) {
-                                if q.gen_peers.contains(&old_id) || q.arbiter_conn_id == Some(old_id) {
+                                if q.gen_peers.contains(&old_id)
+                                    || q.arbiter_conn_id == Some(old_id)
+                                {
                                     tasks_to_remove.push((task_id.clone(), message_id.clone()));
                                 }
                             }
@@ -275,7 +315,11 @@ impl Hub {
                 // Remove old connection's sender if we evicted a stale entry
                 if let Some(old_id) = stale_conn_id {
                     self.senders.lock().await.remove(&old_id);
-                    let line = format!("{} [peer] {} reconnected (replaced stale connection)", hlog::ts(), peer_id);
+                    let line = format!(
+                        "{} [peer] {} reconnected (replaced stale connection)",
+                        hlog::ts(),
+                        peer_id
+                    );
                     self.emit(&line).await;
                 }
 
@@ -298,25 +342,30 @@ impl Hub {
                     let mut state = self.state.lock().await;
                     state.busy_answerers.insert(conn_id);
                     stats_str = serialize_swarm_stats(&state);
-                    state.task_to_message.insert(bench_task_id.clone(), bench_m_id.clone());
-                    state.messages.insert(bench_m_id.clone(), PendingMessage {
-                        message_id: bench_m_id.clone(),
-                        probe_conn_id: 0,
-                        text: String::new(),
-                        messages: Vec::new(),
-                        task_id: bench_task_id.clone(),
-                        gen_peers: vec![conn_id],
-                        results: Vec::new(),
-                        expected_results: 1,
-                        arbiter_task_id: None,
-                        arbiter_conn_id: None,
-                        start: Instant::now(),
-                        phase: MessagePhase::Generating,
-                        task_type: TaskType::Benchmark,
-                        route_tag: None,
-                        classify_task_id: None,
-                        classify_conn_id: None,
-                    });
+                    state
+                        .task_to_message
+                        .insert(bench_task_id.clone(), bench_m_id.clone());
+                    state.messages.insert(
+                        bench_m_id.clone(),
+                        PendingMessage {
+                            message_id: bench_m_id.clone(),
+                            probe_conn_id: 0,
+                            text: String::new(),
+                            messages: Vec::new(),
+                            task_id: bench_task_id.clone(),
+                            gen_peers: vec![conn_id],
+                            results: Vec::new(),
+                            expected_results: 1,
+                            arbiter_task_id: None,
+                            arbiter_conn_id: None,
+                            start: Instant::now(),
+                            phase: MessagePhase::Generating,
+                            task_type: TaskType::Benchmark,
+                            route_tag: None,
+                            classify_task_id: None,
+                            classify_conn_id: None,
+                        },
+                    );
                 }
 
                 let system = format!("{SWARM_SYSTEM_PROMPT}\n\nCurrent swarm state:\n{stats_str}");
@@ -341,33 +390,50 @@ impl Hub {
                 }
             }
 
-            ClientMsg::Result { task_id, text, tok_s, tokens, inference_ms } => {
-                self.handle_result(conn_id, task_id, text, tok_s, tokens, inference_ms).await;
+            ClientMsg::Result {
+                task_id,
+                text,
+                tok_s,
+                tokens,
+                inference_ms,
+            } => {
+                self.handle_result(conn_id, task_id, text, tok_s, tokens, inference_ms)
+                    .await;
             }
 
             ClientMsg::Heartbeat { peer_id: _, load } => {
                 self.state.lock().await.update_load(conn_id, load);
             }
 
-            ClientMsg::Message { text, messages, route: _, classifier_ms: _, classifier_score: _ } => {
+            ClientMsg::Message {
+                text,
+                messages,
+                route: _,
+                classifier_ms: _,
+                classifier_score: _,
+            } => {
                 let messages = messages.unwrap_or_else(|| {
                     vec![ChatMessage {
                         role: "user".to_string(),
                         content: text.unwrap_or_default(),
                     }]
                 });
-                let display_text = messages.last()
+                let display_text = messages
+                    .last()
                     .map(|m| m.content.clone())
                     .unwrap_or_default();
 
                 // Enforce 1000-character limit (v1-protocol.md)
                 if display_text.chars().count() > 1000 {
-                    let err = HubMsg::Error { text: "Message too long (max 1000 characters)".to_string() };
+                    let err = HubMsg::Error {
+                        text: "Message too long (max 1000 characters)".to_string(),
+                    };
                     self.send_to(conn_id, &err).await;
                     return;
                 }
 
-                self.process_incoming_message(conn_id, display_text, messages).await;
+                self.process_incoming_message(conn_id, display_text, messages)
+                    .await;
             }
         }
     }
@@ -424,7 +490,12 @@ impl Hub {
 
     // ── Question routing ────────────────────────────────────────────
 
-    async fn process_incoming_message(self: &Arc<Self>, probe_conn_id: usize, text: String, messages: Vec<crate::protocol::ChatMessage>) {
+    async fn process_incoming_message(
+        self: &Arc<Self>,
+        probe_conn_id: usize,
+        text: String,
+        messages: Vec<crate::protocol::ChatMessage>,
+    ) {
         let m_id = format!("m_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
         let line = hlog::message_received(&m_id, &text);
@@ -441,12 +512,25 @@ impl Hub {
         };
 
         // All messages go through swarm classification
-        if self.try_dispatch_classify(&m_id, probe_conn_id, &text, &messages).await {
+        if self
+            .try_dispatch_classify(&m_id, probe_conn_id, &text, &messages)
+            .await
+        {
             return; // Classify dispatched, will continue after result
         }
 
         // No tagger available: proceed with route_tag=None (default Answer flow)
-        if self.route_message(&m_id, probe_conn_id, &text, &messages, TaskType::Answer, None).await {
+        if self
+            .route_message(
+                &m_id,
+                probe_conn_id,
+                &text,
+                &messages,
+                TaskType::Answer,
+                None,
+            )
+            .await
+        {
             return;
         }
 
@@ -456,7 +540,9 @@ impl Hub {
             drop(state);
             let line = hlog::queue_full(&m_id);
             self.emit(&line).await;
-            let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
+            let err = HubMsg::Error {
+                text: "No peers available and queue is full".to_string(),
+            };
             self.send_to(probe_conn_id, &err).await;
             return;
         }
@@ -510,7 +596,13 @@ impl Hub {
             _ => m_id.to_string(), // time/archivist: task_id = m_id
         };
         let max_tokens: u32 = match task_type {
-            TaskType::Answer => if route_tag == Some("swarm") { 256 } else { 128 },
+            TaskType::Answer => {
+                if route_tag == Some("swarm") {
+                    256
+                } else {
+                    128
+                }
+            }
             TaskType::Time => 64,
             TaskType::Archivist => 60,
             TaskType::Arbiter | TaskType::Benchmark | TaskType::Classify => unreachable!(),
@@ -525,7 +617,9 @@ impl Hub {
             peers_to_send.push((*conn_id, peer_info.clone()));
         }
 
-        state.task_to_message.insert(task_id.clone(), m_id.to_string());
+        state
+            .task_to_message
+            .insert(task_id.clone(), m_id.to_string());
 
         let pending = PendingMessage {
             message_id: m_id.to_string(),
@@ -557,7 +651,8 @@ impl Hub {
         drop(state);
 
         // One log line listing all assigned peers
-        let peer_labels: Vec<(String, String)> = peers_to_send.iter()
+        let peer_labels: Vec<(String, String)> = peers_to_send
+            .iter()
             .map(|(_, p)| (p.peer_id.clone(), p.model_size.clone()))
             .collect();
         let line = hlog::task_assigned(&task_id, &peer_labels);
@@ -661,7 +756,9 @@ impl Hub {
         };
 
         state.messages.insert(m_id.to_string(), pending);
-        state.task_to_message.insert(cls_task_id.clone(), m_id.to_string());
+        state
+            .task_to_message
+            .insert(cls_task_id.clone(), m_id.to_string());
         state.busy_taggers.insert(tagger_conn_id);
 
         drop(state);
@@ -702,7 +799,7 @@ impl Hub {
                 _ => return, // Already handled or moved on
             };
 
-            message.phase = MessagePhase::Generating;  // Prevent re-entry
+            message.phase = MessagePhase::Generating; // Prevent re-entry
 
             // Extract all data before releasing the mutable borrow on message
             let cls_task_id = message.classify_task_id.clone();
@@ -724,7 +821,17 @@ impl Hub {
         }
 
         // Transition to Generating and route
-        if self.route_message(m_id, probe_conn_id, &text, &messages, TaskType::Answer, None).await {
+        if self
+            .route_message(
+                m_id,
+                probe_conn_id,
+                &text,
+                &messages,
+                TaskType::Answer,
+                None,
+            )
+            .await
+        {
             return;
         }
 
@@ -734,7 +841,9 @@ impl Hub {
             drop(state);
             let line = hlog::queue_full(m_id);
             self.emit(&line).await;
-            let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
+            let err = HubMsg::Error {
+                text: "No peers available and queue is full".to_string(),
+            };
             self.send_to(probe_conn_id, &err).await;
         } else {
             state.normal_queue.push_back(QueuedMessage {
@@ -757,7 +866,9 @@ impl Hub {
                 let mut state = self.state.lock().await;
                 let has_idle = state.peers.iter().any(|(id, peer)| {
                     !state.busy_answerers.contains(id)
-                        && peer.capabilities.contains(&crate::state::Capability::Answerer)
+                        && peer
+                            .capabilities
+                            .contains(&crate::state::Capability::Answerer)
                 });
                 if !has_idle {
                     break;
@@ -779,19 +890,23 @@ impl Hub {
                     break;
                 }
             } else {
-                let dispatched = self.route_message(
-                    &queued.message_id,
-                    queued.probe_conn_id,
-                    &queued.text,
-                    &queued.messages,
-                    queued.task_type,
-                    queued.route_tag.as_deref(),
-                ).await;
+                let dispatched = self
+                    .route_message(
+                        &queued.message_id,
+                        queued.probe_conn_id,
+                        &queued.text,
+                        &queued.messages,
+                        queued.task_type,
+                        queued.route_tag.as_deref(),
+                    )
+                    .await;
 
                 if !dispatched {
                     let mut state = self.state.lock().await;
                     match queued.task_type {
-                        TaskType::Answer | TaskType::Arbiter => state.normal_queue.push_front(queued),
+                        TaskType::Answer | TaskType::Arbiter => {
+                            state.normal_queue.push_front(queued)
+                        }
                         TaskType::Time | TaskType::Archivist => state.low_queue.push_front(queued),
                         TaskType::Benchmark | TaskType::Classify => unreachable!(),
                     }
@@ -812,7 +927,8 @@ impl Hub {
         tokens: u32,
         inference_ms: u64,
     ) {
-        self.handle_result_inner(conn_id, task_id, text, tok_s, tokens, inference_ms).await;
+        self.handle_result_inner(conn_id, task_id, text, tok_s, tokens, inference_ms)
+            .await;
         self.try_dispatch_queue().await;
     }
 
@@ -827,7 +943,11 @@ impl Hub {
     ) {
         // Enforce 2000-character limit on result text (v1-protocol.md)
         if text.chars().count() > 2000 {
-            let line = format!("{} [error] result for task {} exceeds 2000 chars, truncating", hlog::ts(), task_id);
+            let line = format!(
+                "{} [error] result for task {} exceeds 2000 chars, truncating",
+                hlog::ts(),
+                task_id
+            );
             self.emit(&line).await;
             // Truncate to 2000 chars (note: we truncate rather than reject since the peer already did the work)
             text = text.chars().take(2000).collect();
@@ -836,7 +956,9 @@ impl Hub {
         // 1. Get peer info, unmark busy, look up message. Handle benchmarks and classify inline.
         let (peer_id, message_id, is_benchmark, is_classify) = {
             let mut state = self.state.lock().await;
-            let peer_id = state.peers.get(&conn_id)
+            let peer_id = state
+                .peers
+                .get(&conn_id)
                 .map(|p| p.peer_id.clone())
                 .unwrap_or_else(|| format!("conn_{conn_id}"));
             let message_id = state.task_to_message.get(&task_id).cloned();
@@ -848,7 +970,8 @@ impl Hub {
                 state.busy_answerers.remove(&conn_id);
             }
 
-            let is_benchmark = message_id.as_ref()
+            let is_benchmark = message_id
+                .as_ref()
                 .and_then(|qid| state.messages.get(qid))
                 .map(|q| q.task_type == TaskType::Benchmark)
                 .unwrap_or(false);
@@ -880,21 +1003,30 @@ impl Hub {
             };
 
             // Parse JSON result: {label, score, scores}
-            let (route_label, score, parse_error) = match serde_json::from_str::<serde_json::Value>(&text) {
-                Ok(json) => {
-                    let label = json.get("label").and_then(|v| v.as_str()).unwrap_or("other");
-                    let score = json.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    (label.to_string(), score, None)
-                }
-                Err(e) => {
-                    // Parse failure → fallback to unrouted
-                    ("other".to_string(), 0.0, Some(e.to_string()))
-                }
-            };
+            let (route_label, score, parse_error) =
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(json) => {
+                        let label = json
+                            .get("label")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("other");
+                        let score = json.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        (label.to_string(), score, None)
+                    }
+                    Err(e) => {
+                        // Parse failure → fallback to unrouted
+                        ("other".to_string(), 0.0, Some(e.to_string()))
+                    }
+                };
 
             // Log parse failure if it occurred
             if let Some(err) = parse_error {
-                let line = format!("{} [classify {}] JSON parse failed: {}, defaulting to other", hlog::ts(), task_id, err);
+                let line = format!(
+                    "{} [classify {}] JSON parse failed: {}, defaulting to other",
+                    hlog::ts(),
+                    task_id,
+                    err
+                );
                 self.emit(&line).await;
             }
 
@@ -911,7 +1043,14 @@ impl Hub {
             };
 
             // Log classify completion
-            let line = hlog::classify_completed(&task_id, &peer_id, &route_label, score, inference_ms, route_tag.is_some());
+            let line = hlog::classify_completed(
+                &task_id,
+                &peer_id,
+                &route_label,
+                score,
+                inference_ms,
+                route_tag.is_some(),
+            );
             self.emit(&line).await;
 
             // Get message details for observer gating and routing
@@ -932,9 +1071,15 @@ impl Hub {
 
             // Observer gating: reject swarm-tagged messages from non-peers
             if route_tag.as_deref() == Some("swarm") && !is_peer {
-                let line = format!("{} [error] {} attempted swarm message without joining", hlog::ts(), message_id);
+                let line = format!(
+                    "{} [error] {} attempted swarm message without joining",
+                    hlog::ts(),
+                    message_id
+                );
                 self.emit(&line).await;
-                let err = HubMsg::Error { text: "Join the swarm to know the swarm.".to_string() };
+                let err = HubMsg::Error {
+                    text: "Join the swarm to know the swarm.".to_string(),
+                };
                 self.send_to(probe_conn_id, &err).await;
 
                 // Mark message as done and clean up
@@ -960,7 +1105,17 @@ impl Hub {
             };
 
             // Transition to Generating and route
-            if self.route_message(&message_id, probe_conn_id, &text, &routed_messages, task_type, route_tag.as_deref()).await {
+            if self
+                .route_message(
+                    &message_id,
+                    probe_conn_id,
+                    &text,
+                    &routed_messages,
+                    task_type,
+                    route_tag.as_deref(),
+                )
+                .await
+            {
                 return;
             }
 
@@ -970,7 +1125,9 @@ impl Hub {
                 drop(state);
                 let line = hlog::queue_full(&message_id);
                 self.emit(&line).await;
-                let err = HubMsg::Error { text: "No peers available and queue is full".to_string() };
+                let err = HubMsg::Error {
+                    text: "No peers available and queue is full".to_string(),
+                };
                 self.send_to(probe_conn_id, &err).await;
             } else {
                 state.normal_queue.push_back(QueuedMessage {
@@ -1031,7 +1188,12 @@ impl Hub {
             drop(state);
 
             let arbiter_secs = result.inference_ms as f64 / 1000.0;
-            let line = hlog::arbiter_completed(&result.task_id, &picked_result.peer_id, candidates, arbiter_secs);
+            let line = hlog::arbiter_completed(
+                &result.task_id,
+                &picked_result.peer_id,
+                candidates,
+                arbiter_secs,
+            );
             self.emit(&line).await;
 
             let total_secs = elapsed_ms as f64 / 1000.0;
@@ -1217,7 +1379,8 @@ impl Hub {
             }];
 
             // Truncate arbiter messages to fit context window
-            let truncated_arbiter_messages = Self::truncate_messages(&arbiter_messages, &arbiter_system, 8);
+            let truncated_arbiter_messages =
+                Self::truncate_messages(&arbiter_messages, &arbiter_system, 8);
 
             // Now take mutable borrow to update phase
             let message = state.messages.get_mut(message_id).unwrap();
@@ -1225,12 +1388,17 @@ impl Hub {
             message.arbiter_conn_id = Some(arbiter_conn_id);
             message.phase = MessagePhase::Arbitrating;
 
-            state.task_to_message.insert(arbiter_task_id.clone(), message_id.to_string());
+            state
+                .task_to_message
+                .insert(arbiter_task_id.clone(), message_id.to_string());
             state.busy_answerers.insert(arbiter_conn_id);
             drop(state);
 
             let line = hlog::arbiter_assigned(
-                &arbiter_task_id, &arbiter_info.peer_id, &arbiter_info.model, &arbiter_info.model_size,
+                &arbiter_task_id,
+                &arbiter_info.peer_id,
+                &arbiter_info.model,
+                &arbiter_info.model_size,
             );
             self.emit(&line).await;
 
@@ -1282,11 +1450,14 @@ impl Hub {
 
                     let line = format!(
                         "{} [error] all peers timed out for question {}",
-                        hlog::ts(), m_id
+                        hlog::ts(),
+                        m_id
                     );
                     self.emit(&line).await;
 
-                    let err = HubMsg::Error { text: "All peers timed out".to_string() };
+                    let err = HubMsg::Error {
+                        text: "All peers timed out".to_string(),
+                    };
                     self.send_to(probe, &err).await;
                 } else {
                     // Got some results — try to arbitrate with what we have
@@ -1307,19 +1478,21 @@ impl Hub {
                         message.phase = MessagePhase::Done;
 
                         // Remove any queued arbiter entry for this message (m4 fix)
-                        state.normal_queue.retain(|q| {
-                            q.arbitration_for.as_ref() != Some(&m_id)
-                        });
+                        state
+                            .normal_queue
+                            .retain(|q| q.arbitration_for.as_ref() != Some(&m_id));
                         drop(state);
 
                         let line = format!(
                             "{} [error] timed out for {}, no arbiter, returning first response",
-                            hlog::ts(), m_id
+                            hlog::ts(),
+                            m_id
                         );
                         self.emit(&line).await;
 
                         let total_secs = elapsed_ms as f64 / 1000.0;
-                        let line = hlog::response_delivered(&m_id, first.tokens, total_secs, peers_used);
+                        let line =
+                            hlog::response_delivered(&m_id, first.tokens, total_secs, peers_used);
                         self.emit(&line).await;
 
                         let response = HubMsg::Response {
@@ -1344,14 +1517,15 @@ impl Hub {
                 message.phase = MessagePhase::Done;
 
                 // Remove any queued arbiter entry for this message (m4 fix)
-                state.normal_queue.retain(|q| {
-                    q.arbitration_for.as_ref() != Some(&m_id)
-                });
+                state
+                    .normal_queue
+                    .retain(|q| q.arbitration_for.as_ref() != Some(&m_id));
                 drop(state);
 
                 let line = format!(
                     "{} [error] arbiter timed out for {}, returning first response",
-                    hlog::ts(), m_id
+                    hlog::ts(),
+                    m_id
                 );
                 self.emit(&line).await;
 
@@ -1426,7 +1600,10 @@ impl Hub {
             content: format!("Current time: {readable}"),
         }];
 
-        if self.route_message(&m_id, 0, "", &messages, TaskType::Time, None).await {
+        if self
+            .route_message(&m_id, 0, "", &messages, TaskType::Time, None)
+            .await
+        {
             return;
         }
 
@@ -1459,7 +1636,13 @@ impl Hub {
         let non_peers = total_conns.saturating_sub(state.peers.len());
         let probes = state.probes.len();
         let observers = non_peers.saturating_sub(probes);
-        let (peer_line, client_line) = hlog::swarm_stats(&state.peers, probes, observers, state.messages_today, state.total_flops);
+        let (peer_line, client_line) = hlog::swarm_stats(
+            &state.peers,
+            probes,
+            observers,
+            state.messages_today,
+            state.total_flops,
+        );
         drop(state);
         self.emit(&peer_line).await;
         if let Some(line) = client_line {
@@ -1469,7 +1652,12 @@ impl Hub {
 
     // ── Archivist ─────────────────────────────────────────────────────
 
-    async fn queue_archivist(self: &Arc<Self>, message_id: &str, question_text: &str, response_text: &str) {
+    async fn queue_archivist(
+        self: &Arc<Self>,
+        message_id: &str,
+        question_text: &str,
+        response_text: &str,
+    ) {
         let arch_id = message_id.replacen("m_", "arch_", 1);
         let messages = vec![ChatMessage {
             role: "user".to_string(),
@@ -1498,7 +1686,9 @@ impl Hub {
     async fn emit(&self, line: &str) {
         println!("{line}");
 
-        let msg = HubMsg::Log { line: line.to_string() };
+        let msg = HubMsg::Log {
+            line: line.to_string(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
 
         let mut senders = self.senders.lock().await;

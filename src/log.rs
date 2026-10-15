@@ -9,11 +9,23 @@ pub fn ts() -> String {
 }
 
 pub fn peer_joined_benchmarking(peer_id: &str, model: &str, model_size: &str) -> String {
-    format!("{} [peer] {} joined ({}, {}, benchmarking...)", ts(), peer_id, model, model_size)
+    format!(
+        "{} [peer] {} joined ({}, {}, benchmarking...)",
+        ts(),
+        peer_id,
+        model,
+        model_size
+    )
 }
 
 pub fn peer_joined_tagger(peer_id: &str, model: &str, model_size: &str) -> String {
-    format!("{} [peer] {} joined ({}, {}, tagger-only)", ts(), peer_id, model, model_size)
+    format!(
+        "{} [peer] {} joined ({}, {}, tagger-only)",
+        ts(),
+        peer_id,
+        model,
+        model_size
+    )
 }
 
 pub fn peer_ready(peer_id: &str, tok_s: f64) -> String {
@@ -29,18 +41,30 @@ pub fn peer_left(peer_id: &str, reason: &str) -> String {
 }
 
 pub fn task_assigned(task_id: &str, peers: &[(String, String)]) -> String {
-    let list = peers.iter()
+    let list = peers
+        .iter()
         .map(|(id, size)| format!("{} ({})", id, size))
         .collect::<Vec<_>>()
         .join(", ");
     format!("{} [task {}] assigned to [{}]", ts(), task_id, list)
 }
 
-pub fn task_completed(task_id: &str, peer_id: &str, tokens: u32, inference_ms: u64, tok_s: f64) -> String {
+pub fn task_completed(
+    task_id: &str,
+    peer_id: &str,
+    tokens: u32,
+    inference_ms: u64,
+    tok_s: f64,
+) -> String {
     let secs = inference_ms as f64 / 1000.0;
     format!(
         "{} [task {}] {} responded ({} tok, {:.1}s, {:.1} tok/s)",
-        ts(), task_id, peer_id, tokens, secs, tok_s
+        ts(),
+        task_id,
+        peer_id,
+        tokens,
+        secs,
+        tok_s
     )
 }
 
@@ -49,20 +73,45 @@ pub fn message_received(m_id: &str, text: &str) -> String {
 }
 
 pub fn arbiter_assigned(arbiter_id: &str, peer_id: &str, model: &str, model_size: &str) -> String {
-    format!("{} [arbiter {}] assigned to {} ({}, {})", ts(), arbiter_id, peer_id, model, model_size)
-}
-
-pub fn arbiter_completed(arbiter_id: &str, picked_peer: &str, candidates: usize, secs: f64) -> String {
     format!(
-        "{} [arbiter {}] picked {} ({} candidates, {:.1}s)",
-        ts(), arbiter_id, picked_peer, candidates, secs
+        "{} [arbiter {}] assigned to {} ({}, {})",
+        ts(),
+        arbiter_id,
+        peer_id,
+        model,
+        model_size
     )
 }
 
-pub fn response_delivered(m_id: &str, total_tokens: u32, total_secs: f64, peers_used: u32) -> String {
+pub fn arbiter_completed(
+    arbiter_id: &str,
+    picked_peer: &str,
+    candidates: usize,
+    secs: f64,
+) -> String {
+    format!(
+        "{} [arbiter {}] picked {} ({} candidates, {:.1}s)",
+        ts(),
+        arbiter_id,
+        picked_peer,
+        candidates,
+        secs
+    )
+}
+
+pub fn response_delivered(
+    m_id: &str,
+    total_tokens: u32,
+    total_secs: f64,
+    peers_used: u32,
+) -> String {
     format!(
         "{} [response {}] delivered ({} total tok, {:.1}s, {} peers)",
-        ts(), m_id, total_tokens, total_secs, peers_used
+        ts(),
+        m_id,
+        total_tokens,
+        total_secs,
+        peers_used
     )
 }
 
@@ -70,7 +119,11 @@ pub fn time_result(peer_id: &str, result_text: &str, tokens: u32, flops: f64) ->
     let text = result_text.trim();
     format!(
         "{} [time] \"{}\" ({}, {} tok, {:.2e} FLOPS)",
-        ts(), text, peer_id, tokens, flops
+        ts(),
+        text,
+        peer_id,
+        tokens,
+        flops
     )
 }
 
@@ -94,37 +147,82 @@ pub fn classify_assigned(task_id: &str, peer_id: &str) -> String {
     format!("{} [classify {}] assigned to {}", ts(), task_id, peer_id)
 }
 
-pub fn classify_completed(task_id: &str, peer_id: &str, route: &str, score: f64, ms: u64, routed: bool) -> String {
+pub fn classify_completed(
+    task_id: &str,
+    peer_id: &str,
+    route: &str,
+    score: f64,
+    ms: u64,
+    routed: bool,
+) -> String {
     if routed {
-        format!("{} [classify {}] {} → \"{}\" ({:.2}, {}ms)", ts(), task_id, peer_id, route, score, ms)
+        format!(
+            "{} [classify {}] {} → \"{}\" ({:.2}, {}ms)",
+            ts(),
+            task_id,
+            peer_id,
+            route,
+            score,
+            ms
+        )
     } else if score < 0.6 {
-        format!("{} [classify {}] {} → \"{}\" ({:.2}, {}ms) below threshold, other", ts(), task_id, peer_id, route, score, ms)
+        format!(
+            "{} [classify {}] {} → \"{}\" ({:.2}, {}ms) below threshold, other",
+            ts(),
+            task_id,
+            peer_id,
+            route,
+            score,
+            ms
+        )
     } else {
         // Score >= 0.6 but label is "other" (unrouted category)
-        format!("{} [classify {}] {} → \"{}\" ({:.2}, {}ms) unrouted", ts(), task_id, peer_id, route, score, ms)
+        format!(
+            "{} [classify {}] {} → \"{}\" ({:.2}, {}ms) unrouted",
+            ts(),
+            task_id,
+            peer_id,
+            route,
+            score,
+            ms
+        )
     }
 }
 
 pub fn classify_timeout(task_id: &str) -> String {
-    format!("{} [classify {}] timed out, proceeding unrouted", ts(), task_id)
+    format!(
+        "{} [classify {}] timed out, proceeding unrouted",
+        ts(),
+        task_id
+    )
 }
 
 pub fn classify_no_tagger() -> String {
-    format!("{} [classify] no tagger available, proceeding unrouted", ts())
+    format!(
+        "{} [classify] no tagger available, proceeding unrouted",
+        ts()
+    )
 }
 
 pub fn swarm_status(peer_count: usize) -> String {
     format!("{} [swarm] {} Peer connected", ts(), peer_count)
 }
 
-pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: usize, messages_today: u64, total_flops: f64) -> (String, Option<String>) {
+pub fn swarm_stats(
+    peers: &HashMap<usize, PeerInfo>,
+    probes: usize,
+    observers: usize,
+    messages_today: u64,
+    total_flops: f64,
+) -> (String, Option<String>) {
     use crate::state::Capability;
 
     let total = peers.len();
     let mut answerer_count = 0;
     let mut tagger_only_count = 0;
     let mut total_tok_s = 0.0;
-    let mut answerer_size_counts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    let mut answerer_size_counts: std::collections::BTreeMap<&str, u32> =
+        std::collections::BTreeMap::new();
 
     for peer in peers.values() {
         let has_answerer = peer.capabilities.contains(&Capability::Answerer);
@@ -140,7 +238,8 @@ pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: u
     }
 
     let peer_line = if tagger_only_count > 0 {
-        let sizes = answerer_size_counts.iter()
+        let sizes = answerer_size_counts
+            .iter()
             .map(|(size, count)| format!("{count} {size}"))
             .collect::<Vec<_>>()
             .join(", ");
@@ -149,22 +248,37 @@ pub fn swarm_stats(peers: &HashMap<usize, PeerInfo>, probes: usize, observers: u
             ts(), total, answerer_count, sizes, total_tok_s, tagger_only_count, messages_today, total_flops
         )
     } else {
-        let sizes = answerer_size_counts.iter()
+        let sizes = answerer_size_counts
+            .iter()
             .map(|(size, count)| format!("{count} {size}"))
             .collect::<Vec<_>>()
             .join(", ");
         format!(
             "{} [swarm] {} Peer: {} | {:.1} tok/s | {} Message | {:.2e} total FLOPS",
-            ts(), total, sizes, total_tok_s, messages_today, total_flops
+            ts(),
+            total,
+            sizes,
+            total_tok_s,
+            messages_today,
+            total_flops
         )
     };
 
     let clients = probes + observers;
     let client_line = if clients > 0 {
         let mut parts = Vec::new();
-        if probes > 0 { parts.push(format!("{probes} Probe")); }
-        if observers > 0 { parts.push(format!("{observers} Observer")); }
-        Some(format!("{} [swarm] {} Client : {}", ts(), clients, parts.join(", ")))
+        if probes > 0 {
+            parts.push(format!("{probes} Probe"));
+        }
+        if observers > 0 {
+            parts.push(format!("{observers} Observer"));
+        }
+        Some(format!(
+            "{} [swarm] {} Client : {}",
+            ts(),
+            clients,
+            parts.join(", ")
+        ))
     } else {
         None
     };
