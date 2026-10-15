@@ -69,7 +69,12 @@ pub fn task_completed(
 }
 
 pub fn message_received(m_id: &str, text: &str) -> String {
-    format!("{} [message {}] received: \"{}\"", ts(), m_id, text)
+    format!(
+        "{} [message {}] received ({} chars)",
+        ts(),
+        m_id,
+        text.chars().count()
+    )
 }
 
 pub fn arbiter_assigned(arbiter_id: &str, peer_id: &str, model: &str, model_size: &str) -> String {
@@ -115,10 +120,18 @@ pub fn response_delivered(
     )
 }
 
+/// Whether the time answer's text is shown in the public log. Off by default:
+/// the sentence is model output.
+pub const SHOW_TIME_TEXT: bool = false;
+
 pub fn time_result(peer_id: &str, result_text: &str, tokens: u32, flops: f64) -> String {
-    let text = result_text.trim();
+    let text = if SHOW_TIME_TEXT {
+        format!("\"{}\"", result_text.trim())
+    } else {
+        "time answered".to_string()
+    };
     format!(
-        "{} [time] \"{}\" ({}, {} tok, {:.2e} FLOPS)",
+        "{} [time] {} ({}, {} tok, {:.2e} FLOPS)",
         ts(),
         text,
         peer_id,
@@ -136,7 +149,12 @@ pub fn queue_full(m_id: &str) -> String {
 }
 
 pub fn archivist_result(task_id: &str, text: &str) -> String {
-    format!("{} [archivist {}] {}", ts(), task_id, text.trim())
+    format!(
+        "{} [archivist {}] filed ({} chars)",
+        ts(),
+        task_id,
+        text.trim().chars().count()
+    )
 }
 
 pub fn archivist_failed(task_id: &str, reason: &str) -> String {
@@ -284,4 +302,31 @@ pub fn swarm_stats(
     };
 
     (peer_line, client_line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_received_hides_the_question() {
+        let line = message_received("m_1", "my secret question");
+        assert!(!line.contains("secret"));
+        assert!(line.contains("m_1") && line.contains("18 chars"));
+    }
+
+    #[test]
+    fn archivist_result_hides_model_text() {
+        let line = archivist_result("m_1", "  STORY:music a summary  ");
+        assert!(!line.contains("STORY") && !line.contains("summary"));
+        assert!(line.contains("m_1") && line.contains("filed"));
+    }
+
+    #[test]
+    fn time_result_hides_text_unless_flag_is_on() {
+        assert!(!SHOW_TIME_TEXT);
+        let line = time_result("p1", "It is 12:00 in Paris.", 7, 1e9);
+        assert!(!line.contains("Paris"));
+        assert!(line.contains("time answered") && line.contains("p1"));
+    }
 }
