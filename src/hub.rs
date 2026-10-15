@@ -7,7 +7,7 @@ use chrono::Timelike;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -104,30 +104,57 @@ fn build_time_query_messages(user_text: &str) -> Vec<ChatMessage> {
     }]
 }
 
-type Tx = futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>;
+/// Messages waiting to be written to one connection. A connection that falls this far
+/// behind is dropped.
+const SEND_QUEUE: usize = 256;
+
+/// The way to one connection: a queue drained by that connection's writer task.
+struct Conn {
+    tx: mpsc::Sender<Message>,
+    writer: tokio::task::AbortHandle,
+}
 
 static NEXT_CONN_ID: AtomicUsize = AtomicUsize::new(1);
 
 pub struct Hub {
     state: Mutex<HubState>,
-    senders: Mutex<HashMap<usize, Tx>>,
+    senders: std::sync::Mutex<HashMap<usize, Conn>>,
 }
 
 impl Hub {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(HubState::new()),
-            senders: Mutex::new(HashMap::new()),
+            senders: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
     pub async fn handle_connection(self: &Arc<Self>, ws: WebSocketStream<TcpStream>) {
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
-        let (tx, mut rx) = ws.split();
+        let (mut sink, mut rx) = ws.split();
 
-        self.senders.lock().await.insert(conn_id, tx);
+        let (tx, mut queue) = mpsc::channel(SEND_QUEUE);
+        let mut writer = tokio::spawn(async move {
+            while let Some(msg) = queue.recv().await {
+                if sink.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+        self.senders.lock().unwrap().insert(
+            conn_id,
+            Conn {
+                tx,
+                writer: writer.abort_handle(),
+            },
+        );
 
-        while let Some(msg) = rx.next().await {
+        loop {
+            let msg = tokio::select! {
+                msg = rx.next() => msg,
+                _ = &mut writer => None,
+            };
+            let Some(msg) = msg else { break };
             let msg = match msg {
                 Ok(Message::Text(text)) => text,
                 Ok(Message::Close(_)) => break,
@@ -148,7 +175,9 @@ impl Hub {
 
         // Connection closed
         let removed = self.state.lock().await.remove_peer(conn_id);
-        self.senders.lock().await.remove(&conn_id);
+        if let Some(conn) = self.senders.lock().unwrap().remove(&conn_id) {
+            conn.writer.abort();
+        }
 
         // Handle classify disconnect: find messages stuck in Classifying phase with this peer
         let classify_fallback_messages: Vec<(
@@ -318,7 +347,9 @@ impl Hub {
 
                 // Remove old connection's sender if we evicted a stale entry
                 if let Some(old_id) = stale_conn_id {
-                    self.senders.lock().await.remove(&old_id);
+                    if let Some(conn) = self.senders.lock().unwrap().remove(&old_id) {
+                        conn.writer.abort();
+                    }
                     let line = format!(
                         "{} [peer] {} reconnected (replaced stale connection)",
                         hlog::ts(),
@@ -1647,7 +1678,7 @@ impl Hub {
         if state.peers.is_empty() {
             return;
         }
-        let total_conns = self.senders.lock().await.len();
+        let total_conns = self.senders.lock().unwrap().len();
         let non_peers = total_conns.saturating_sub(state.peers.len());
         let probes = state.probes.len();
         let observers = non_peers.saturating_sub(probes);
@@ -1697,7 +1728,8 @@ impl Hub {
 
     // ── Transport ───────────────────────────────────────────────────
 
-    /// Print to stdout and broadcast to all connected clients.
+    /// Print to stdout and broadcast to all connected clients. Never waits on a client:
+    /// a client whose queue is full or closed is dropped.
     async fn emit(&self, line: &str) {
         println!("{line}");
 
@@ -1706,32 +1738,34 @@ impl Hub {
         };
         let json = serde_json::to_string(&msg).unwrap();
 
-        let mut senders = self.senders.lock().await;
-        let mut dead = Vec::new();
-
-        for (&conn_id, tx) in senders.iter_mut() {
-            if tx.send(Message::Text(json.clone())).await.is_err() {
-                dead.push(conn_id);
-            }
-        }
-
+        let mut senders = self.senders.lock().unwrap();
+        let dead: Vec<usize> = senders
+            .iter()
+            .filter(|(_, conn)| conn.tx.try_send(Message::Text(json.clone())).is_err())
+            .map(|(&conn_id, _)| conn_id)
+            .collect();
         for id in dead {
-            senders.remove(&id);
+            if let Some(conn) = senders.remove(&id) {
+                conn.writer.abort();
+            }
         }
     }
 
+    /// Queues a message for one connection. Returns false if the connection is gone or
+    /// too far behind (and is dropped).
     async fn send_to(&self, conn_id: usize, msg: &HubMsg) -> bool {
         let json = serde_json::to_string(msg).unwrap();
-        let mut senders = self.senders.lock().await;
-        if let Some(tx) = senders.get_mut(&conn_id) {
-            if tx.send(Message::Text(json)).await.is_err() {
-                senders.remove(&conn_id);
-                return false;
-            }
-            true
-        } else {
-            false
+        let mut senders = self.senders.lock().unwrap();
+        let Some(conn) = senders.get(&conn_id) else {
+            return false;
+        };
+        if conn.tx.try_send(Message::Text(json)).is_ok() {
+            return true;
         }
+        if let Some(conn) = senders.remove(&conn_id) {
+            conn.writer.abort();
+        }
+        false
     }
 }
 
@@ -1774,7 +1808,7 @@ mod tests {
             .await
             .unwrap();
         let conn_id = loop {
-            if let Some(id) = hub.senders.lock().await.keys().next().copied() {
+            if let Some(id) = hub.senders.lock().unwrap().keys().next().copied() {
                 break id;
             }
             tokio::task::yield_now().await;
@@ -1933,5 +1967,59 @@ mod tests {
         let hex = id.strip_prefix("m_").unwrap();
         assert_eq!(hex.len(), 16);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+    /// A hub that accepts any number of connections.
+    async fn hub_serving() -> (Arc<Hub>, std::net::SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hub = Hub::new();
+        let server_hub = Arc::clone(&hub);
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let hub = Arc::clone(&server_hub);
+                tokio::spawn(async move {
+                    let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    hub.handle_connection(ws).await;
+                });
+            }
+        });
+        (hub, addr)
+    }
+
+    async fn wait_for_connections(hub: &Arc<Hub>, n: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hub.senders.lock().unwrap().len() != n {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("connection count");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_does_not_hold_up_the_others() {
+        let (hub, addr) = hub_serving().await;
+        let url = format!("ws://{addr}/ws");
+        let (_stuck, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        wait_for_connections(&hub, 1).await;
+        let stuck_id = *hub.senders.lock().unwrap().keys().next().unwrap();
+        let (mut healthy, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        wait_for_connections(&hub, 2).await;
+        tokio::spawn(async move { while healthy.next().await.is_some() {} });
+
+        let line = "x".repeat(64 * 1024);
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for _ in 0..1000 {
+                hub.emit(&line).await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("emit waited on a client that does not read");
+
+        let senders = hub.senders.lock().unwrap();
+        assert_eq!(senders.len(), 1);
+        assert!(!senders.contains_key(&stuck_id));
     }
 }
