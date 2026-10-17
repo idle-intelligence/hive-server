@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use or build on this software, please cite it as below."
+title: "hive-server"
+authors:
+  - family-names: Cambau
+    given-names: Thomas
+    affiliation: Idle Intelligence
+license: Apache-2.0
+repository-code: "https://github.com/idle-intelligence/hive-server"
