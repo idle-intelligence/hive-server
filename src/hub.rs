@@ -8,6 +8,8 @@ use chrono::Timelike;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -117,6 +119,21 @@ struct Conn {
     writer: tokio::task::AbortHandle,
 }
 
+/// How often the hub pings every connection.
+#[cfg(not(test))]
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const PING_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a connection may send no frame at all (pongs count) before the hub closes it.
+#[cfg(not(test))]
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a closing connection gets to flush its close frame.
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
+
 /// How long a generation or arbiter task may take before the hub answers without it.
 #[cfg(not(test))]
 const TASK_TIMEOUT: Duration = Duration::from_secs(12);
@@ -158,12 +175,26 @@ impl Hub {
             },
         );
 
+        let mut ping = tokio::time::interval(PING_INTERVAL);
+        let mut last_seen = Instant::now();
         loop {
             let msg = tokio::select! {
                 msg = rx.next() => msg,
                 _ = &mut writer => None,
+                _ = ping.tick() => {
+                    if last_seen.elapsed() > IDLE_TIMEOUT {
+                        self.close_idle(conn_id, &mut writer).await;
+                        break;
+                    }
+                    let conn_tx = self.senders.lock().unwrap().get(&conn_id).map(|c| c.tx.clone());
+                    if let Some(tx) = conn_tx {
+                        let _ = tx.try_send(Message::Ping(Vec::new()));
+                    }
+                    continue;
+                }
             };
             let Some(msg) = msg else { break };
+            last_seen = Instant::now();
             let msg = match msg {
                 Ok(Message::Text(text)) => text,
                 Ok(Message::Close(_)) => break,
@@ -264,6 +295,21 @@ impl Hub {
             let status = hlog::swarm_status(count);
             self.emit(&status).await;
         }
+    }
+
+    /// Closes a connection that sent nothing for IDLE_TIMEOUT, with code 1001 (going away):
+    /// the peer is gone, and the hub is not in error. The caller then runs the normal cleanup.
+    async fn close_idle(&self, conn_id: usize, writer: &mut tokio::task::JoinHandle<()>) {
+        let conn = self.senders.lock().unwrap().remove(&conn_id);
+        let Some(conn) = conn else { return };
+        let frame = CloseFrame {
+            code: CloseCode::Away,
+            reason: "idle".into(),
+        };
+        let _ = conn.tx.try_send(Message::Close(Some(frame)));
+        drop(conn.tx);
+        let _ = tokio::time::timeout(CLOSE_GRACE, &mut *writer).await;
+        writer.abort();
     }
 
     async fn handle_message(self: &Arc<Self>, conn_id: usize, msg: ClientMsg) {
@@ -2501,6 +2547,54 @@ mod tests {
             assert_eq!(error["text"], expected);
         }
         assert!(hub.state.lock().await.peers.is_empty());
+    }
+
+    async fn register_as(hub: &Arc<Hub>, ws: &mut Ws, peer_id: &str) {
+        send_json(
+            ws,
+            serde_json::json!({"type":"register","peer_id":peer_id,"model":"m","model_size":"1B","capabilities":["tagger"]}),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !hub
+                .state
+                .lock()
+                .await
+                .peers
+                .values()
+                .any(|p| p.peer_id == peer_id)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("registered");
+    }
+
+    #[tokio::test]
+    async fn a_silent_client_is_closed_and_its_name_is_freed() {
+        let (hub, addr) = hub_serving().await;
+        // Registers, then is never read again, so it never answers a ping.
+        let mut silent = connect(addr).await;
+        register_as(&hub, &mut silent, "silent").await;
+        let mut healthy = connect(addr).await;
+        register_as(&hub, &mut healthy, "healthy").await;
+        let healthy_reader = tokio::spawn(async move { while healthy.next().await.is_some() {} });
+
+        tokio::time::sleep(IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        let peers: Vec<String> = hub
+            .state
+            .lock()
+            .await
+            .peers
+            .values()
+            .map(|p| p.peer_id.clone())
+            .collect();
+        assert_eq!(peers, vec!["healthy".to_string()]);
+        assert!(!healthy_reader.is_finished());
+
+        let mut again = connect(addr).await;
+        register_as(&hub, &mut again, "silent").await;
     }
 
     #[tokio::test]
