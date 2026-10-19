@@ -446,6 +446,7 @@ impl Hub {
                         content: "How many peers are there in the swarm?".to_string(),
                     }],
                     max_tokens: 128,
+                    temperature: None,
                     text: None,
                 };
                 // m5 fix: check send result and remove from busy on failure
@@ -778,6 +779,10 @@ impl Hub {
                 system,
                 messages: truncated_messages,
                 max_tokens,
+                temperature: match task_type {
+                    TaskType::Archivist => Some(0.0),
+                    _ => None,
+                },
                 text: None,
             };
             self.send_to(*conn_id, &task).await;
@@ -875,6 +880,7 @@ impl Hub {
             system: String::new(),
             messages: Vec::new(),
             max_tokens: 0,
+            temperature: None,
             text: Some(text.to_string()),
         };
         self.send_to(tagger_conn_id, &task).await;
@@ -1594,6 +1600,7 @@ impl Hub {
                 system: arbiter_system,
                 messages: truncated_arbiter_messages,
                 max_tokens: 8,
+                temperature: Some(0.0),
                 text: None,
             };
             self.send_to(arbiter_conn_id, &task).await;

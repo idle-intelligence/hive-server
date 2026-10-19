@@ -67,6 +67,9 @@ pub enum HubMsg {
         system: String,
         messages: Vec<ChatMessage>,
         max_tokens: u32,
+        /// Sampling temperature for the task; 0 means greedy. Absent: the drone's default.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        temperature: Option<f32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
@@ -133,6 +136,24 @@ mod tests {
     #[test]
     fn rejects_unknown_type() {
         assert!(serde_json::from_str::<ClientMsg>(r#"{"type":"nope"}"#).is_err());
+    }
+
+    #[test]
+    fn task_serializes_temperature_only_when_set() {
+        let task = |temperature| HubMsg::Task {
+            task_id: "t1".to_string(),
+            message_id: None,
+            task_type: "arbiter".to_string(),
+            system: String::new(),
+            messages: Vec::new(),
+            max_tokens: 8,
+            temperature,
+            text: None,
+        };
+        let greedy = serde_json::to_value(task(Some(0.0))).unwrap();
+        assert_eq!(greedy["temperature"], 0.0);
+        let default = serde_json::to_value(task(None)).unwrap();
+        assert!(default.get("temperature").is_none());
     }
 
     #[test]
